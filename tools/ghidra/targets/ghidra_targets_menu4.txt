@@ -1,0 +1,6 @@
+# Menu RE round 4: the MainMenu list widget -- how entries are ordered
+22d99e0 list_add        # 2d99e0(list, widget, &"list-item") -- the builder's attach for every button
+22d9ad0 list_insert     # 2d9ad0(list, &{widget,0}, &"list-item") -- how Exit is added
+22d8540 list_ctor       # 2d8540(alloc(0x508), 0, 1, 2) -- the list widget constructor
+227f880 widget_prep     # 227f880(btn, 4) called before every list add
+22da460 list_selcb      # sets the list's selection callback (lambda void(int))

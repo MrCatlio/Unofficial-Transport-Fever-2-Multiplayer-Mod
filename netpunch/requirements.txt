@@ -1,0 +1,4 @@
+pystun3
+miniupnpc
+zstandard
+cryptography

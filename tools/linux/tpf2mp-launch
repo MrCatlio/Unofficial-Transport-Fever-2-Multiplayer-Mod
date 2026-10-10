@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Steam launch options: "/absolute/path/to/tpf2mp-launch" %command%
+set -euo pipefail
+if [ $# -eq 0 ]; then
+  echo 'Use this wrapper in Transport Fever 2 Steam launch options followed by %command%.' >&2
+  exit 2
+fi
+root=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+# Steam's container (pressure-vessel) bind-mounts the folder of every
+# LD_PRELOAD library read-only. Preloading the copy in boot/ keeps that lock off
+# $root, whose data/ the mod must write (logs, lobby and command-hook state).
+boot=$root/boot/libtpf2mp_boot.so
+case "$boot" in *[[:space:]:]*) echo "Loader path contains unsupported whitespace or colon: $boot" >&2; exit 1 ;; esac
+if [ ! -f "$boot" ]; then
+  echo "Multiplayer loader is missing: $boot. Run the installer again." >&2
+  exit 1
+fi
+# Use the install's data home even when Steam changes HOME (Snap/Flatpak).
+export XDG_DATA_HOME=${root%/tpf2mp}
+export LD_PRELOAD="$boot${LD_PRELOAD:+:$LD_PRELOAD}"
+exec "$@"

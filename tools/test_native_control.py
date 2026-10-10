@@ -1,0 +1,88 @@
+"""Compile production native IPC; force a Windows rename-sharing conflict.
+
+The engine is a stub. This specifically tests acknowledgement persistence, not
+native engine save/load correctness.
+"""
+from pathlib import Path
+import subprocess
+
+root = Path(__file__).resolve().parents[1]
+out = root / '.local-test/tests/native-control'
+out.mkdir(parents=True, exist_ok=True)
+code = r'''
+#include <windows.h>
+#include <atomic>
+#include <cassert>
+#include <fstream>
+#include <iterator>
+#include <queue>
+#include <mutex>
+#include "NATIVE_IO"
+#include "NATIVE_CONTROL"
+std::atomic<int> pauses{0};
+std::mutex eventMutex;
+std::queue<NativeIo::Event> events;
+namespace NativeIo {
+bool Save(const std::string&,const std::string&) { return false; }
+bool Load(const std::string&,const std::string&) { return false; }
+bool PauseAndDrain(const std::string& id) {
+    ++pauses; std::lock_guard<std::mutex> l(eventMutex);
+    events.push({id,"paused","",true}); return true;
+}
+bool Poll(Event& e) { std::lock_guard<std::mutex> l(eventMutex); if(events.empty())return false; e=events.front();events.pop();return true; }
+std::atomic<int> gestureKey{0};
+bool HasWorld(){return true;} bool Busy(){return false;}
+bool SetActionsHeld(bool held){return !held || !gestureKey.load();} int ActiveGestureKey(){return gestureKey.load();}
+void WorkThreads(DWORD& ui,DWORD& command){ui=GetCurrentThreadId();command=0;}
+}
+#include "CONTROL_CPP"
+std::string read(const char* path) {std::ifstream f(path);return std::string(std::istreambuf_iterator<char>(f),{});}
+template<class F> void waitFor(F f) {for(int i=0;i<100;++i){if(f())return;Sleep(20);}assert(false);}
+int main() {
+    const char* event="tpf2_native_event.txt";
+    {std::ofstream f(event);f<<"old acknowledgement\n";}
+    HANDLE held=CreateFileA(event,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
+    assert(held!=INVALID_HANDLE_VALUE);
+    {std::ofstream f("tpf2_native_request.txt",std::ios::binary);f<<"pid="<<GetCurrentProcessId()<<"\nid=stale\ncmd=pause\n";}
+    // an earlier process's failed recovery, with our pid (Wine reuses it every run)
+    {std::ofstream f("tpf2_sync_lua.txt",std::ios::binary);f<<"operation=d32f09d477f361325ba205f75993bca5\nepoch=e7c4db8731ca28e50d004275be489f7c\nrevision=1\nphase=error\nresume_speed=0\npid="<<GetCurrentProcessId()<<"\n";}
+    NativeControl::Start(L".",true);
+    Sleep(150); assert(pauses==0);
+    assert(read("tpf2_sync_lua.txt").empty());   // emptied at start: the mod must not hold on it
+    {std::ofstream f("tpf2_native_request.txt",std::ios::binary);f<<"pid="<<GetCurrentProcessId()<<"\nid=once\ncmd=pause\n";}
+    waitFor([]{return pauses==1;});
+    Sleep(300);
+    assert(read(event).find("old acknowledgement")!=std::string::npos);
+    assert(read("tpf2_native_status.txt").find("event_published=0")!=std::string::npos);
+    // the liveness fields the lobby reads: this thread's CPU time (the stub's
+    // "UI thread"), no command thread yet, the process's IO counters
+    { auto status=read("tpf2_native_status.txt");
+      assert(status.find("\ncpu_ui=")!=std::string::npos && status.find("\ncpu_command=0\n")!=std::string::npos);
+      assert(status.find("\nio_read=")!=std::string::npos && status.find("\nio_write=")!=std::string::npos); }
+    CloseHandle(held);
+    waitFor([&]{return read(event).find("step=paused\nsuccess=1")!=std::string::npos;});
+    assert(pauses==1); // completion was repeated, never the engine command
+    // a key held past the old 10 s deadline (push-to-talk while talking): the
+    // hold waits, the status names the key, and holds once it is released
+    NativeIo::gestureKey=0x56;
+    {std::ofstream f("tpf2_native_request.txt",std::ios::binary);f<<"pid="<<GetCurrentProcessId()<<"\nid=hold1\ncmd=hold\n";}
+    waitFor([]{return read("tpf2_native_status.txt").find("\nhold_key=86\n")!=std::string::npos;});
+    Sleep(10500);
+    assert(read(event).find("id=hold1")==std::string::npos);
+    NativeIo::gestureKey=0;
+    waitFor([&]{return read(event).find("id=hold1\nstep=held\nsuccess=1")!=std::string::npos;});
+    waitFor([]{return read("tpf2_native_status.txt").find("\nhold_key=0\n")!=std::string::npos;});
+    NativeControl::SignalShutdown(); Sleep(200);
+    puts("PASS: native completion survives Windows sharing violation without repeating engine command; an earlier process's recovery record is emptied at start; a hold waits out a held key past 10 s");
+}
+'''
+code = code.replace('NATIVE_IO', (root/'native/src/native_io.h').as_posix())
+code = code.replace('NATIVE_CONTROL', (root/'native/src/native_control.h').as_posix())
+code = code.replace('CONTROL_CPP', (root/'native/src/native_control.cpp').as_posix())
+(out/'test.cpp').write_text(code)
+vcvars = root / 'tools' / 'msvc_env.bat'
+(out/'build.cmd').write_text(f'@echo off\ncall "{vcvars}" || exit /b 1\n'
+    'cl /nologo /EHsc /W4 test.cpp /Fe:test.exe >build.log 2>&1\n'
+    'if errorlevel 1 (type build.log & exit /b 1)\nexit /b 0\n')
+subprocess.run(['cmd','/d','/c',str(out/'build.cmd')], cwd=out, check=True, timeout=180)  # absolute: a relative name fails on some shells
+subprocess.run([str(out / 'test.exe')], cwd=out, check=True, timeout=40)

@@ -1,0 +1,168 @@
+"""Loopback test of the relay-only host (python tools/relay_selftest.py): relay + joiners on 127.0.0.1.
+The first joiner (leader) sends start(save=<file>); the relay must receive the
+upload, push it to the second joiner, and both must get start save=true."""
+import json, os, socket, subprocess, sys, time, tempfile, shutil
+def free_udp_ports(n):
+    # Game ports are picked free on every run. Fixed 7791-7794 sat inside the
+    # bridge's fallback range, and a fourth game on this PC holding 7792 made
+    # the frames check fail with a UDP reset (2026-09-10).
+    socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(n)]
+    for k in socks:
+        k.bind(("127.0.0.1", 0))
+    ports = [k.getsockname()[1] for k in socks]
+    for k in socks:
+        k.close()
+    return ports
+DAVE_RELAY, DAVE_LOCAL, ERIN_RELAY, ERIN_LOCAL = free_udp_ports(4)
+NP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "netpunch")
+tmp = tempfile.mkdtemp(prefix="relaytest_")
+def d(n):
+    p = os.path.join(tmp, n); os.makedirs(p, exist_ok=True); return p
+save = os.path.join(tmp, "world.sav"); open(save, "wb").write(os.urandom(3 * 1024 * 1024))
+open(save + ".lua", "w").write('return { ["lockstep.lua"] = { } }\n')   # made with the mod
+nomod = os.path.join(tmp, "nomod.sav"); open(nomod, "wb").write(os.urandom(64 * 1024))
+open(nomod + ".lua", "w").write('return { ["guidesystem.lua"] = { } }\n')    # made WITHOUT the mod
+procs = []
+def run(args, iodir, name):
+    lg = open(os.path.join(tmp, name + ".log"), "w")
+    p = subprocess.Popen([sys.executable, "lobby.py"] + args + ["--io-dir", iodir], cwd=NP, stdout=lg, stderr=subprocess.STDOUT)
+    procs.append(p); return p
+def events(iodir):
+    out = []
+    try:
+        for ln in open(os.path.join(iodir, "lobby_out.jsonl"), encoding="utf-8"):
+            ln = ln.strip()
+            if ln:
+                try: out.append(json.loads(ln))
+                except ValueError: pass
+    except FileNotFoundError: pass
+    return out
+def wait(pred, t=20):
+    end = time.time() + t
+    while time.time() < end:
+        if pred(): return True
+        time.sleep(0.2)
+    return pred()
+try:
+    # ---- a PLAIN host first: the roster's host must be the host, never a joiner
+    # (0.4.5-0.4.9 named the oldest joiner in every lobby; nobody could connect)
+    hd = d("plainhost"); run(["host", "--crossplay", "--name", "Hosty", "--local-port", "29572"], hd, "plainhost")
+    assert wait(lambda: any(e.get("type") == "code" for e in events(hd)), 40), "plain host: no code"
+    _cev = [e for e in events(hd) if e.get("type") == "code"][0]
+    pcode = _cev.get("cross_code") or _cev["code"]
+    jd = d("plainjoin"); run(["join", pcode, "--name", "Joiny", "--local-port", "0", "--no-mesh"], jd, "plainjoin")
+    assert wait(lambda: any(e.get("type") == "roster" and "Joiny" in e.get("players", []) for e in events(jd)), 40), "plain join: no roster"
+    rj = [e for e in events(jd) if e.get("type") == "roster"][-1]
+    assert rj.get("host") == "Hosty" and rj.get("relay") is False, rj
+    rh = [e for e in events(hd) if e.get("type") == "roster"][-1]
+    assert rh.get("host") == "Hosty", rh
+    print("plain host/join roster OK")
+    # a plain host refuses to share a save made without the mod
+    with open(os.path.join(hd, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": nomod}) + "\n")
+    assert wait(lambda: any(e.get("type") == "status" and "does not have" in e.get("detail", "") for e in events(hd)), 15), "plain host shared a save made without the mod"
+    assert wait(lambda: any(e.get("type") == "chat" and "Mods panel" in e.get("text", "") for e in events(hd)), 5), "no chat explanation on the host"
+    assert not any(e.get("type") == "save_ready" for e in events(jd)), "a save without the mod reached the joiner"
+    print("plain host refuses a save without the mod OK")
+    for pr in procs: pr.kill()
+    time.sleep(1); procs.clear()
+    rd = d("relay"); run(["host", "--relay-only", "--name", "Relay", "--lobby-name", "Relay Test", "--local-port", "29571"], rd, "relay")
+    assert wait(lambda: any(e.get("type") == "code" for e in events(rd)), 40), "no code"
+    code = [e for e in events(rd) if e.get("type") == "code"][0]["code"]
+    print("code", code[:12] + "...")
+    ad = d("a"); run(["join", code, "--name", "Alice", "--local-port", "0", "--no-mesh"], ad, "alice")
+    assert wait(lambda: any(e.get("type") == "roster" and "Alice" in e.get("players", []) for e in events(ad)), 40), "alice not in roster"
+    bd = d("b"); run(["join", code, "--name", "Bob", "--local-port", "0", "--no-mesh"], bd, "bob")
+    assert wait(lambda: any(e.get("type") == "roster" and "Bob" in e.get("players", []) for e in events(ad)), 40), "bob not in roster"
+    ra = [e for e in events(ad) if e.get("type") == "roster"][-1]
+    print("alice roster:", ra)
+    assert ra.get("host") == "Alice" and ra.get("relay") is True, "alice should lead"
+    assert ra.get("letters", {}).get("Alice") == "a" and ra.get("letters", {}).get("Bob") == "b", "letters"
+    # a fresh relay with no stored world: the leader is asked for START GAME, the others wait for it
+    assert wait(lambda: any(e.get("type") == "status" and "press START GAME to send your most recent save" in e.get("detail", "") for e in events(ad)), 10), "leader not asked for START GAME"
+    assert wait(lambda: any(e.get("type") == "status" and "waiting for the leader" in e.get("detail", "") for e in events(bd)), 10), "bob not told to wait for the leader"
+    print("no stored world: leader asked for START GAME, others wait OK")
+    # the relay leader refuses to upload a save made without the mod
+    with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": nomod}) + "\n")
+    assert wait(lambda: any(e.get("type") == "status" and "does not have" in e.get("detail", "") for e in events(ad)), 15), "relay leader uploaded a save made without the mod"
+    time.sleep(2)
+    assert not any(e.get("type") == "save_ready" for e in events(bd)), "a save without the mod reached bob"
+    print("relay leader refuses a save without the mod OK")
+    # the leader starts with a save
+    with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": save}) + "\n")
+    assert wait(lambda: any(e.get("type") == "save_ready" for e in events(bd)), 60), "bob never got the save"
+    assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(bd)), 30), "bob no start"
+    assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(ad)), 30), "alice no start"
+    got = open(os.path.join(bd, "incoming_save.sav"), "rb").read()
+    assert got == open(save, "rb").read(), "save bytes differ"
+    # hot join: Carol arrives, Alice re-shares; only Carol should receive
+    cd = d("c"); run(["join", code, "--name", "Carol", "--local-port", "0", "--no-mesh"], cd, "carol")
+    assert wait(lambda: any(e.get("type") == "roster" and "Carol" in e.get("players", []) for e in events(ad)), 40), "carol not in roster"
+    nb = len([e for e in events(bd) if e.get("type") == "save_ready"])
+    with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": save}) + "\n")
+    # Zed joins while Carol's transfer is in flight: must be served right after
+    zd = d("zed"); run(["join", code, "--name", "Zed", "--local-port", "0", "--no-mesh"], zd, "zed")
+    assert wait(lambda: any(e.get("type") == "save_ready" for e in events(cd)), 60), "carol never got the save"
+    assert wait(lambda: any(e.get("type") == "save_ready" for e in events(zd)), 90), "zed (joined mid-transfer) never got the save"
+    assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(zd)), 30), "zed no start"
+    assert wait(lambda: any(e.get("type") == "start" for e in events(cd)), 30), "carol no start"
+    time.sleep(2)
+    assert len([e for e in events(bd) if e.get("type") == "save_ready"]) == nb, "bob re-received the save"
+    rc = [e for e in events(cd) if e.get("type") == "roster"][-1]
+    assert rc.get("letters", {}).get("Carol") == "c", rc
+    # ---- restart the relay: same code (kept secret), letters remembered, the stored save is continued automatically
+    for pr in procs: pr.kill()
+    time.sleep(1.5); procs.clear()
+    open(os.path.join(rd, "lobby_out.jsonl"), "w").close()
+    run(["host", "--relay-only", "--name", "Relay", "--lobby-name", "Relay Test", "--local-port", "29571"], rd, "relay2")
+    assert wait(lambda: any(e.get("type") == "code" for e in events(rd)), 40), "no code after restart"
+    code2 = [e for e in events(rd) if e.get("type") == "code"][0]["code"]
+    print("old code still used below; new code differs only by its timestamp:", code2 != code)
+    # Dave and Erin run WITH the mesh (as real players do) and with game relay
+    # ports, so lockstep frames can be checked both ways through the relay
+    dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--game-relay-port", str(DAVE_RELAY), "--game-local-port", str(DAVE_LOCAL)], dd, "dave")
+    assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
+    rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
+    assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "e", rdv     # a,b,c,d are remembered for Alice/Bob/Carol/Zed
+    assert wait(lambda: any(e.get("type") == "status" and "loading the relay's world" in e.get("detail", "") for e in events(dd)), 10), "no auto-resume status"
+    assert wait(lambda: any(e.get("type") == "save_ready" for e in events(dd)), 60), "dave never got the stored save"
+    assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"
+    assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"
+    # ---- game frames both ways through the relay (the leader is a joiner like any other)
+    ed = d("erin"); run(["join", code, "--name", "Erin", "--local-port", "0", "--game-relay-port", str(ERIN_RELAY), "--game-local-port", str(ERIN_LOCAL)], ed, "erin")
+    assert wait(lambda: any(e.get("type") == "roster" and "Erin" in e.get("players", []) for e in events(dd)), 40), "erin not in roster"
+    time.sleep(3)
+    dave_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); dave_bridge.bind(("127.0.0.1", DAVE_LOCAL)); dave_bridge.settimeout(0.5)
+    erin_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); erin_bridge.bind(("127.0.0.1", ERIN_LOCAL)); erin_bridge.settimeout(0.5)
+    def xfer(src, dst_relay_port, sink, tag):
+        got = set()
+        for i in range(20):
+            src.sendto(b"LSTICK test %s %d" % (tag, i), ("127.0.0.1", dst_relay_port))
+            time.sleep(0.05)
+        end = time.time() + 8
+        while time.time() < end and len(got) < 20:
+            try:
+                data, _ = sink.recvfrom(2048)
+                if data.startswith(b"LSTICK test " + tag): got.add(data)
+            except socket.timeout: pass
+        return len(got)
+    e2d = xfer(erin_bridge, ERIN_RELAY, dave_bridge, b"e2d")   # Erin's bridge -> Erin's lobby -> relay -> Dave's lobby -> Dave's bridge
+    d2e = xfer(dave_bridge, DAVE_RELAY, erin_bridge, b"d2e")   # and the other way
+    print(f"frames: erin->dave {e2d}/20, dave->erin {d2e}/20")
+    assert e2d >= 15, "frames to the LEADER do not arrive (the plain-to-relay bug)"
+    assert d2e >= 15, "frames from the leader do not arrive"
+    print("RELAY SELFTEST OK (incl. restart + auto-resume + frames)")
+finally:
+    for p in procs:
+        try: p.kill()
+        except Exception: pass
+    time.sleep(1)
+    for n in ("relay", "relay2", "alice", "bob", "carol", "dave", "erin"):
+        try:
+            lines = open(os.path.join(tmp, n + ".log"), encoding="utf-8", errors="replace").read().splitlines()
+            print("---", n, "(last 6)"); print("\n".join(lines[-6:]))
+        except FileNotFoundError: pass
+    shutil.rmtree(tmp, ignore_errors=True)

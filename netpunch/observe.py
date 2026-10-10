@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+observe.py -- build a "connectivity profile" for one machine (Phase 2).
+
+We learn everything a peer needs to reach us, and how constrained our NAT is:
+
+* STUN, run on the SAME socket the game will use (mapping is per-socket), asked
+  of several public servers. Two answers with the same mapped port => the NAT
+  keeps one external port per socket (endpoint-independent = "normal"). Two
+  different ports => symmetric NAT, which is very hard to punch.
+* UPnP (miniupnpc, falling back to the upnpc CLI -- upnpc.exe on Windows): ask
+  the router for its WAN IP and for an explicit port mapping on the game port.
+  Success => "open".
+* IPv6 enumeration, preferring a 2002: 6to4 address (globally routable via HE
+  relays even when the ISP gives no native v6).
+
+Flags produced:
+    open       -- UPnP gave us a forwarded port on the game port
+    symmetric  -- STUN mapped ports disagreed across servers
+    cgnat      -- carrier-grade NAT (router WAN IP != STUN public IP, or the
+                  STUN IP sits in 100.64.0.0/10)
+    v6         -- we have a usable global / 6to4 IPv6 address
+
+Profile (printed as JSON, re-runnable since mappings expire):
+    {
+      "candidates": {"lan_v4": "ip:port", "public_v4": "ip:port",
+                     "v6": "[ip]:port" | null},
+      "flags": {"open": bool, "symmetric": bool, "cgnat": bool, "v6": bool},
+      ... diagnostics ...
+    }
+
+Importable:  observe(local_port=29471) -> dict
+CLI:         python observe.py [--local-port 29471] [--no-upnp]
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import os
+import json
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+import stun
+
+from punch import DEFAULT_PORT, open_socket
+
+# STUN servers, fastest/most-reliable first so we usually satisfy the two-answer
+# comparison before touching a slow one. Google + Cloudflare are the spec set;
+# the rest are spares.
+STUN_SERVERS = [
+    ("stun.l.google.com", 19302),
+    ("stun.nextcloud.com", 3478),
+    ("stun.cloudflare.com", 3478),
+    ("stun.services.mozilla.com", 3478),
+]
+
+
+def _stun_servers():
+    """STUN_SERVERS, or TPF2MP_STUN="host:port,host:port" when set -- the NAT lab
+    (tools/nat_lab) runs its own STUN server on a simulated internet."""
+    env = os.environ.get("TPF2MP_STUN", "").strip()
+    if not env:
+        return STUN_SERVERS
+    out = []
+    for item in env.split(","):
+        host, _, port = item.strip().rpartition(":")
+        if host and port.isdigit():
+            out.append((host, int(port)))
+    return out or STUN_SERVERS
+
+
+STUN_PER_SERVER_TIMEOUT = 1.0    # socket timeout per attempt
+STUN_TOTAL_DEADLINE = 8.0        # give up after this many seconds total
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+# --------------------------------------------------------------------------- #
+# Local address discovery
+# --------------------------------------------------------------------------- #
+def preferred_ip(family=socket.AF_INET, probe=None):
+    """Source IP the OS would use to reach the internet (no packets sent)."""
+    if probe is None:
+        probe = ("2001:4860:4860::8888", 80) if family == socket.AF_INET6 \
+            else ("8.8.8.8", 80)
+    s = socket.socket(family, socket.SOCK_DGRAM)
+    try:
+        s.connect(probe)
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+_ULA = ipaddress.ip_network("fc00::/7")          # Tailscale ULA, etc.
+
+# Virtual-LAN adapters. A friend on the same Hamachi / Tailscale / ZeroTier
+# network reaches this address directly, NAT or no NAT, so the host's code
+# carries it and the joiner dials it first (connect.py). Hamachi hands out
+# 25.0.0.0/8, Tailscale 100.64.0.0/10 (the CGNAT range, but on a LOCAL adapter
+# that is Tailscale). ZeroTier ranges are per network: TPF2MP_VPN_IP names
+# the adapter address by hand for those.
+_VPN_NETS = (ipaddress.ip_network("25.0.0.0/8"), ipaddress.ip_network("100.64.0.0/10"))
+
+
+def local_v4_addresses():
+    """Every IPv4 address of this machine's adapters (getaddrinfo on the hostname)."""
+    found = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            a = info[4][0]
+            if a not in found:
+                found.append(a)
+    except socket.gaierror:
+        pass
+    return found
+
+
+def vpn_ips(addresses=None):
+    """The virtual-LAN adapter addresses to advertise, at most two: a manual
+    TPF2MP_VPN_IP first, then Hamachi, then Tailscale."""
+    out = []
+    manual = os.environ.get("TPF2MP_VPN_IP", "").strip()
+    if manual:
+        try:
+            ipaddress.IPv4Address(manual)
+            out.append(manual)
+        except ValueError:
+            pass
+    addrs = local_v4_addresses() if addresses is None else addresses
+    for net in _VPN_NETS:
+        for a in addrs:
+            try:
+                ip = ipaddress.IPv4Address(a)
+            except ValueError:
+                continue
+            if ip in net and a not in out:
+                out.append(a)
+    return out[:2]
+
+
+def vpn_ip(addresses=None):
+    v = vpn_ips(addresses)
+    return v[0] if v else None
+_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
+
+
+def _v6_usable(addr):
+    """True if a friend on the open internet could plausibly reach ``addr``.
+
+    NB: Python's ipaddress marks 6to4 (2002::/16) as *private*, so we cannot
+    lean on ``is_global`` -- it would drop the very address we want. We keep
+    6to4 explicitly and otherwise accept only global unicast (2000::/3) that
+    isn't ULA or documentation.
+    """
+    try:
+        ip = ipaddress.IPv6Address(addr)
+    except ValueError:
+        return False
+    if ip.is_link_local or ip.is_loopback or ip.is_multicast:
+        return False
+    if ip in _ULA:
+        return False
+    if addr.startswith("2002:"):        # 6to4 -- routable via HE relays
+        return True
+    if ip in _GLOBAL_UNICAST and not addr.startswith("2001:db8"):
+        return True
+    return False
+
+
+def enumerate_v6():
+    """Return (best, all_usable) IPv6 addresses, preferring 2002: 6to4.
+
+    Sources: the connect-trick (the address the OS actually routes outbound --
+    authoritative) plus getaddrinfo(hostname) (which is racy on Windows and may
+    omit the 6to4 address on any given call).
+    """
+    found = []
+
+    def add(addr):
+        if addr:
+            a = addr.split("%")[0]
+            if a not in found and _v6_usable(a):
+                found.append(a)
+
+    add(preferred_ip(socket.AF_INET6))               # authoritative outbound v6
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       family=socket.AF_INET6):
+            add(info[4][0])
+    except socket.gaierror:
+        pass
+
+    # Prefer a 6to4 address; it is tied to the real public v4 and reaches any
+    # other 6to4/native host through HE relays.
+    sixto4 = [a for a in found if a.startswith("2002:")]
+    best = sixto4[0] if sixto4 else (found[0] if found else None)
+    return best, found
+
+
+# --------------------------------------------------------------------------- #
+# STUN
+# --------------------------------------------------------------------------- #
+def stun_map(sock, servers=None, want=2, deadline=STUN_TOTAL_DEADLINE):
+    """Query STUN servers on ``sock`` until we have ``want`` mapped answers.
+
+    Returns (answers, log) where answers is a list of dicts
+    {server, ip, port, ms} and log is a human-readable per-server list.
+    """
+    servers = servers or _stun_servers()
+    stun._initialize()  # populate pystun3's msg-type tables (stun_test skips this)
+    prev_timeout = sock.gettimeout()
+    sock.settimeout(STUN_PER_SERVER_TIMEOUT)
+    answers, log = [], []
+    start = time.time()
+    try:
+        for host, port in servers:
+            if len(answers) >= want or (time.time() - start) > deadline:
+                break
+            t0 = time.time()
+            try:
+                r = stun.stun_test(sock, host, port, "0.0.0.0", 0)
+            except Exception as e:                      # noqa: BLE001
+                log.append(f"{host}:{port} error {type(e).__name__} "
+                           f"({time.time()-t0:.2f}s)")
+                continue
+            ms = (time.time() - t0) * 1000
+            if r.get("Resp") and r.get("ExternalIP"):
+                answers.append({"server": f"{host}:{port}",
+                                "ip": r["ExternalIP"], "port": r["ExternalPort"],
+                                "ms": round(ms)})
+                log.append(f"{host}:{port} -> {r['ExternalIP']}:"
+                           f"{r['ExternalPort']} ({ms:.0f}ms)")
+            else:
+                log.append(f"{host}:{port} no-response ({ms:.0f}ms)")
+    finally:
+        sock.settimeout(prev_timeout)
+    return answers, log
+
+
+# --------------------------------------------------------------------------- #
+# UPnP
+# --------------------------------------------------------------------------- #
+# The CLI fallback's name in the profile and in errors.
+_UPNPC_LABEL = "upnpc.exe" if sys.platform == "win32" else "upnpc"
+
+
+def _upnpc_run(exe, args):
+    """Run the upnpc CLI. On Linux a frozen lobby has its bundled libraries
+    (_internal/) first in LD_LIBRARY_PATH; the system's upnpc gets the caller's
+    value back (linuxpaths.child_env) so it loads its own."""
+    env = None
+    if sys.platform != "win32":
+        import linuxpaths
+        env = linuxpaths.child_env()
+    return subprocess.run([exe] + list(args), capture_output=True, text=True,
+                          timeout=8, env=env)
+
+
+def upnp_map(game_port, keep=False):
+    """Try to open ``game_port`` on the router. Degrades gracefully.
+
+    Returns dict: {open, wan_ip, lan_ip, method, detail}. Never raises.
+    """
+    result = {"open": False, "tcp_open": False, "tcp_detail": None, "wan_ip": None, "lan_ip": None,
+              "method": None, "detail": None}
+
+    # --- Preferred: the miniupnpc module ---
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 2000
+        if u.discover() > 0:
+            u.selectigd()
+            result["method"] = "miniupnpc"
+            result["lan_ip"] = u.lanaddr
+            try:
+                result["wan_ip"] = u.externalipaddress()
+            except Exception:                            # noqa: BLE001
+                pass
+            try:
+                ok = u.addportmapping(game_port, "UDP", u.lanaddr, game_port,
+                                      "netpunch", "")
+                result["open"] = bool(ok)
+                if ok and not keep:
+                    # We only needed to prove it works; connect.py re-adds it.
+                    try:
+                        u.deleteportmapping(game_port, "UDP")
+                    except Exception:                    # noqa: BLE001
+                        pass
+            except Exception as e:                       # noqa: BLE001
+                result["detail"] = f"addportmapping failed: {e}"
+            # TCP is independent of UDP: Steam can carry control traffic even
+            # when the UDP mapping failed. Report TCP failures instead of
+            # treating a successful UDP mapping as proof that TCP is open.
+            if keep:
+                try:
+                    result["tcp_open"] = bool(u.addportmapping(
+                        game_port, "TCP", u.lanaddr, game_port, "netpunch save transfer", ""))
+                    result["tcp_detail"] = None if result["tcp_open"] else "the router refused the mapping"
+                except Exception as e:                   # noqa: BLE001
+                    result["tcp_detail"] = f"addportmapping failed: {e}"
+            return result
+        result["detail"] = "no IGD discovered"
+    except ImportError:
+        result["detail"] = "miniupnpc module unavailable"
+    except Exception as e:                               # noqa: BLE001
+        result["detail"] = f"miniupnpc error: {e}"
+
+    # --- Fallback: the upnpc CLI (upnpc.exe on Windows), if present on PATH ---
+    exe = shutil.which("upnpc") or shutil.which("upnpc.exe")
+    if exe:
+        try:
+            out = _upnpc_run(exe, ["-l"]).stdout
+            result["method"] = _UPNPC_LABEL
+            for line in out.splitlines():
+                low = line.lower()
+                if "externalipaddress" in low.replace(" ", ""):
+                    result["wan_ip"] = line.split("=")[-1].strip()
+                if "local lan ip address" in low:
+                    result["lan_ip"] = line.split(":")[-1].strip()
+            add = _upnpc_run(exe, ["-a", result["lan_ip"] or "", str(game_port),
+                                   str(game_port), "UDP"])
+            result["open"] = "is redirected" in add.stdout.lower() \
+                or add.returncode == 0
+            if keep:
+                tcp = _upnpc_run(exe,
+                    ["-a", result["lan_ip"] or "", str(game_port), str(game_port), "TCP"])
+                result["tcp_open"] = "is redirected" in tcp.stdout.lower() or tcp.returncode == 0
+                result["tcp_detail"] = None if result["tcp_open"] else "upnpc TCP mapping failed"
+            if result["open"] and not keep:
+                _upnpc_run(exe, ["-d", str(game_port), "UDP"])
+        except Exception as e:                           # noqa: BLE001
+            result["detail"] = f"{_UPNPC_LABEL} error: {e}"
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Top-level profile
+# --------------------------------------------------------------------------- #
+def upnp_unmap(game_port):
+    """Remove the UDP mapping ``upnp_map(..., keep=True)`` left on the router.
+    Best-effort, never raises; returns True if a delete was issued."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 1000
+        if u.discover() > 0:
+            u.selectigd()
+            try:
+                u.deleteportmapping(game_port, "TCP")    # the save-transfer mapping, if the router took it
+            except Exception:                            # noqa: BLE001
+                pass
+            try:
+                u.deleteportmapping(game_port, "UDP")
+                return True
+            except Exception:                            # noqa: BLE001
+                return False
+    except Exception:                                    # noqa: BLE001
+        pass
+    exe = shutil.which("upnpc") or shutil.which("upnpc.exe")
+    if exe:
+        try:
+            _upnpc_run(exe, ["-d", str(game_port), "TCP"])
+            _upnpc_run(exe, ["-d", str(game_port), "UDP"])
+            return True
+        except Exception:                                # noqa: BLE001
+            return False
+    return False
+
+
+def upnp_map_tcp(port, desc="netpunch save transfer (joiner)"):
+    """Open tcp/``port`` on the router (a Steam-reached joiner's bulk listener).
+
+    Returns (ok, public_wan_ip_or_None, detail). Never raises. The WAN IP is
+    None when the router reports a private or CGNAT one (nothing outside can
+    dial it)."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 2000
+        if u.discover() <= 0:
+            return False, None, "no IGD discovered"
+        u.selectigd()
+        wan = None
+        try:
+            wan = u.externalipaddress()
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            ok = bool(u.addportmapping(int(port), "TCP", u.lanaddr, int(port), desc, ""))
+        except Exception as e:                           # noqa: BLE001
+            return False, None, f"addportmapping failed: {e}"
+        try:
+            a = ipaddress.ip_address(wan) if wan else None
+            if a is None or a.is_private or a in _CGNAT_NET or a.is_loopback or a.is_unspecified:
+                wan = None
+        except ValueError:
+            wan = None
+        return ok, wan, None if ok else "the router refused the mapping"
+    except ImportError:
+        return False, None, "miniupnpc module unavailable"
+    except Exception as e:                               # noqa: BLE001
+        return False, None, f"miniupnpc error: {e}"
+
+
+def upnp_unmap_tcp(port):
+    """Remove ``upnp_map_tcp``'s mapping. Best effort, never raises."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 1000
+        if u.discover() > 0:
+            u.selectigd()
+            return bool(u.deleteportmapping(int(port), "TCP"))
+    except Exception:                                    # noqa: BLE001
+        pass
+    return False
+
+
+def _fmt(ip, port):
+    if ip is None:
+        return None
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def observe(local_port=DEFAULT_PORT, sock=None, do_upnp=True, keep_upnp=False):
+    """Produce a connectivity profile dict. Reusable at connect time."""
+    own_sock = sock is None
+    if own_sock:
+        sock = open_socket(local_port, socket.AF_INET)
+    try:
+        t0 = time.time()
+        stun_answers, stun_log = stun_map(sock)
+        stun_elapsed = time.time() - t0
+    finally:
+        if own_sock:
+            sock.close()
+
+    # --- symmetric: do the mapped ports agree? ---
+    ports = {a["port"] for a in stun_answers}
+    symmetric = len(ports) > 1
+    public_ip = stun_answers[0]["ip"] if stun_answers else None
+    public_port = stun_answers[0]["port"] if stun_answers else None
+
+    # --- UPnP ---
+    upnp = upnp_map(local_port, keep=keep_upnp) if do_upnp else \
+        {"open": False, "wan_ip": None, "lan_ip": None, "method": "skipped",
+         "detail": None}
+
+    # --- cgnat: WAN IP disagrees with STUN, or STUN IP is in 100.64/10 ---
+    cgnat = False
+    if upnp["wan_ip"] and public_ip and upnp["wan_ip"] != public_ip:
+        cgnat = True
+    if public_ip:
+        try:
+            if ipaddress.ip_address(public_ip) in _CGNAT_NET:
+                cgnat = True
+        except ValueError:
+            pass
+
+    # --- STUN down? fall back to the UPnP mapping ---
+    # STUN is how the public ip:port is normally learned, but both servers can
+    # time out (measured 2026-08-30: 4 s no-response from each, while UPnP was
+    # perfectly healthy). Without a public candidate the shared code offers only
+    # a LAN address and a 6to4 v6, so a friend on another network has nothing to
+    # dial -- the lobby just never connects. A successful UPnP mapping already
+    # tells us the WAN IP, and the mapping is port-preserving by construction, so
+    # wan_ip:local_port IS the public candidate. Flagged in the profile so the
+    # diagnosis stays honest about where the address came from.
+    public_from_upnp = False
+    if not public_ip and upnp["open"] and upnp["wan_ip"]:
+        try:
+            addr = ipaddress.ip_address(upnp["wan_ip"])
+            if not (addr.is_private or addr in _CGNAT_NET):
+                public_ip, public_port = upnp["wan_ip"], local_port
+                public_from_upnp = True
+        except ValueError:
+            pass
+
+    # --- IPv6 ---
+    v6_best, v6_all = enumerate_v6()
+
+    lan_ip = upnp["lan_ip"] or preferred_ip(socket.AF_INET)
+    vpns = vpn_ips() + [None, None]
+
+    profile = {
+        "candidates": {
+            "lan_v4": _fmt(lan_ip, local_port),
+            "public_v4": _fmt(public_ip, public_port),
+            "v6": _fmt(v6_best, local_port),
+            "vpn_v4": _fmt(vpns[0], local_port),
+            "vpn2_v4": _fmt(vpns[1], local_port),
+        },
+        "flags": {
+            "open": bool(upnp["open"]),
+            "symmetric": bool(symmetric),
+            "cgnat": bool(cgnat),
+            "v6": v6_best is not None,
+        },
+        "local_port": local_port,
+        "public_from_upnp": public_from_upnp,
+        "stun": {
+            "answers": stun_answers,
+            "log": stun_log,
+            "elapsed_ms": round(stun_elapsed * 1000),
+            "timed_out": len(stun_answers) < 2,
+        },
+        "upnp": upnp,
+        "v6_all": v6_all,
+    }
+    return profile
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="netpunch connectivity profiler")
+    ap.add_argument("--local-port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--no-upnp", action="store_true",
+                    help="skip the UPnP probe (faster)")
+    args = ap.parse_args(argv)
+    profile = observe(local_port=args.local_port, do_upnp=not args.no_upnp)
+    print(json.dumps(profile, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

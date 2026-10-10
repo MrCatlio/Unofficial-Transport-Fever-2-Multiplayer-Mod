@@ -1,0 +1,124 @@
+# deploy_shipping.ps1 -- lay the game folder out EXACTLY as the MSI will, from the
+# dev build outputs, so the rig test exercises the shipping paths:
+#
+#   <game>\alut.dll                 proxy (the stock library is alut_real.dll, renamed by the MSI)
+#   <game>\tpf2_bridge_mp.dll       lockstep transport  (proxy loads it: next-to-proxy rule)
+#   <game>\tpf2_menu.dll            lobby overlay
+#   <game>\tpf2_slice.dll           capture/cancel hooks (proxy loads it at start)
+#   <game>\tpf2_slice.cfg           installer/cfg defaults
+#   <game>\netpunch\netpunch.exe    frozen lobby (menu resolves NETDIR = <dll dir>\netpunch),
+#   <game>\netpunch\_internal\      its libraries (a PyInstaller folder build)
+#   <game>\mods\mp_lockstep_1\**    the Lua mod (deploy_mod.ps1 also refreshes the userdata copy)
+#
+# Runtime data goes to %LOCALAPPDATA%\tpf2mp\data (created by the DLLs). Instance
+# B under Sandboxie gets its own copy of that dir inside the box.
+#
+#   tools\deploy_shipping.ps1            deploy everything (game must be closed)
+#   tools\deploy_shipping.ps1 -Clean     also wipe %LOCALAPPDATA%\tpf2mp\data (fresh identity/logs)
+param([switch]$Clean, [switch]$Cfg)   # -Cfg: also overwrite the two cfgs in the game dir (LIVE settings; kept by default)
+$ErrorActionPreference = "Stop"
+$Repo = Split-Path -Parent $PSScriptRoot
+$Game = $null
+foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780',
+                 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780')) {
+    try { $v = (Get-ItemProperty $k -Name InstallLocation -EA Stop).InstallLocation; if ($v -and (Test-Path (Join-Path $v 'TransportFever2.exe'))) { $Game = $v; break } } catch {}
+}
+if (-not $Game -or -not (Test-Path (Join-Path $Game 'TransportFever2.exe'))) {
+    $vdfCandidates = @(
+        "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
+        "C:\Program Files (x86)\Steam\config\libraryfolders.vdf"
+    )
+    foreach ($vdf in $vdfCandidates) {
+        if (Test-Path $vdf) {
+            $content = Get-Content $vdf -Raw
+            $allMatches = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+            foreach ($m in $allMatches) {
+                $lib = $m.Groups[1].Value.Replace("\\", "\")
+                $cand = Join-Path $lib "steamapps\common\Transport Fever 2"
+                if (Test-Path (Join-Path $cand 'TransportFever2.exe')) {
+                    $Game = $cand
+                    break
+                }
+            }
+            if ($Game) { break }
+        }
+    }
+}
+if (-not $Game) { $Game = "C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2" }
+if (-not (Test-Path (Join-Path $Game 'TransportFever2.exe'))) { throw "game not found at $Game" }
+if (Get-Process TransportFever2 -EA SilentlyContinue) { throw "close both game instances first" }
+Write-Host "[ship] game dir: $Game"
+
+function Put($src, $dst) {
+    if (-not (Test-Path $src)) { throw "missing build output: $src" }
+    Copy-Item $src $dst -Force
+    Write-Host ("[ship]   {0,-24} <- {1}  ({2:N0} B, {3:HH:mm})" -f (Split-Path $dst -Leaf), $src.Replace($Repo + '\', ''), (Get-Item $src).Length, (Get-Item $src).LastWriteTime)
+}
+if (-not (Test-Path (Join-Path $Game 'alut_real.dll'))) { throw "alut_real.dll absent: install the MSI once first" }
+Put "$Repo\native\out\alut.dll"           (Join-Path $Game 'alut.dll')
+Put "$Repo\native\out\tpf2_bridge_mp.dll" (Join-Path $Game 'tpf2_bridge_mp.dll')
+Put "$Repo\native\out\tpf2_menu.dll"      (Join-Path $Game 'tpf2_menu.dll')
+# The CANONICAL name, never "whatever is newest".
+#
+# This used to be `Get-ChildItem tpf2_slice*.dll | Sort LastWriteTime | Last 1`.
+# build.bat takes an optional suffix (an injected DLL stays locked for the
+# life of the game process, so iterating means building tpf2_slice_foo.dll), and
+# every one of those lands in the same out dir -- so the last experiment anyone
+# built silently became the shipped artifact, under the shipping name, with
+# nothing in the output saying which file it actually was.
+$sliceSrc = "$Repo\native\out\tpf2_slice.dll"
+if (-not (Test-Path $sliceSrc)) {
+    throw "missing build output: $sliceSrc -- run native\build.bat slice with NO suffix argument (a suffixed build is a dev iteration and is never shipped)"
+}
+# A suffixed build that is newer is almost always the one being worked on, and
+# shipping the stale canonical DLL instead is just as silent a failure the other
+# way round. Say so; do not guess.
+$sliceStamp = (Get-Item $sliceSrc).LastWriteTime
+Get-ChildItem "$Repo\native\out\tpf2_slice*.dll" -EA SilentlyContinue |
+    Where-Object { $_.Name -ne 'tpf2_slice.dll' -and $_.LastWriteTime -gt $sliceStamp } |
+    ForEach-Object { Write-Warning "[ship] $($_.Name) is NEWER than tpf2_slice.dll and will NOT be shipped -- rebuild without a suffix if that is the one you want" }
+Put $sliceSrc                             (Join-Path $Game 'tpf2_slice.dll')
+Put "$Repo\native\out\tpf2_pluginhost.dll"   (Join-Path $Game 'tpf2_pluginhost.dll')
+# The cfgs are settings read next to the DLLs (tpf2_slice.cfg's diagnostics and
+# exec_delay, tpf2mp.cfg's plugin settings): an existing copy is left alone
+# unless -Cfg, so a local setting is not lost to the shipped defaults.
+foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
+    $dst = Join-Path $Game $c
+    if ($Cfg -or -not (Test-Path $dst)) { Put "$Repo\installer\cfg\$c" $dst }
+    else { Write-Host "[ship]   $c kept (live settings; pass -Cfg to overwrite)" }
+}
+
+# Native plugins. Big Maps lives in this repo (bigmap\, built by native\build.bat
+# bigmap or all); a missing build is not an error, it just means that feature is
+# not under test. Its cfg goes with it: a plugin with no cfg next to it runs on
+# built-in defaults.
+$PluginDir = Join-Path $Game 'plugins'
+New-Item -ItemType Directory -Force $PluginDir | Out-Null
+Put "$Repo\native\out\tpf2_workshop_register.dll" (Join-Path $PluginDir 'tpf2_workshop_register.dll')
+$bigmapDll = Join-Path $Repo 'bigmap\out\tpf2_bigmap.dll'
+if (Test-Path $bigmapDll) {
+    Put $bigmapDll (Join-Path $PluginDir 'tpf2_bigmap.dll')
+    Put (Join-Path $Repo 'bigmap\cfg\tpf2_bigmap.cfg') (Join-Path $PluginDir 'tpf2_bigmap.cfg')
+} else { Write-Host ("[ship]   plugin bigmap: not built (looked in {0}) -- skipped" -f $bigmapDll) }
+New-Item -ItemType Directory -Force (Join-Path $Game 'netpunch') | Out-Null
+if (Test-Path "$Repo\netpunch\dist\netpunch\netpunch.exe") {
+    Put "$Repo\netpunch\dist\netpunch\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.exe')
+    # the lobby's libraries: mirrored (a stale extra file there is a wrong library),
+    # the netpunch folder itself is not -- the lobby's logs and state files live there
+    & robocopy "$Repo\netpunch\dist\netpunch\_internal" (Join-Path $Game 'netpunch\_internal') /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Host "[ship] robocopy of netpunch\_internal failed ($LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+    Write-Host "[ship]   netpunch\_internal mirrored"
+} else {
+    Write-Host "[ship]   netpunch\dist not built -- keeping existing netpunch in game dir"
+}
+
+& "$Repo\tools\deploy_mod.ps1" -Mod mp_lockstep_1 | Select-Object -Last 1
+
+if ($Clean) {
+    foreach ($d in @((Join-Path $env:LOCALAPPDATA 'tpf2mp\data'),
+                     "C:\Sandbox\$env:USERNAME\GameAgent\user\current\AppData\Local\tpf2mp\data",
+                     "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\AppData\Local\tpf2mp\data")) {
+        if (Test-Path $d) { Remove-Item "$d\*" -Recurse -Force -EA SilentlyContinue; Write-Host "[ship] cleaned $d" }
+    }
+}
+Write-Host "[ship] done. Launch with tools\mp_menu_launch.ps1 (proxy now loads bridge+menu+slice at start; no injector)." -ForegroundColor Green

@@ -1,0 +1,1729 @@
+-- mp/inject.lua -- inject reader (pollInject)
+--
+-- Split out of lockstep.lua on 2026-09-08. Loaded from the game script as
+--     require("mp.inject")(CM, K, log)
+-- A FACTORY so each load of the game script gets fresh file-scope state.
+-- Symbols shared between modules live in CM (CM.<name>); K is the constants
+-- table, log the instance-tagged logger. Body kept at column 0 on purpose:
+-- tools/luacheck.py's use-before-define checks look at column-0 declarations.
+return function(CM, K, log)
+-- A wait time as the wire carries it (also defined in lines.lua; whichever loads
+-- first wins): the engine's float, "inf" for the cargo slider's unlimited wait.
+CM.waitNum = CM.waitNum or function(s, d)
+	if s == nil then return d end
+	if s == "inf" or s == "+inf" then return math.huge end
+	if s == "-inf" then return -math.huge end
+	if type(s) == "number" then return s end
+	return tonumber(s) or d
+end
+-- SOLO IS SOLO. The slice leaves a build alone when no peer is playing (see
+-- SessionLive in slice_hook.cpp), so the engine has already built it -- replaying
+-- it here would build it a second time. Reading the file and dropping the lines
+-- keeps the offset moving, so nothing is replayed later when somebody does join.
+--
+-- Between them, the two halves mean an installed copy of this mod changes
+-- nothing at all in a single-player game: the build is not cancelled and not
+-- replayed, and the player gets stock behaviour.
+CM.warnedSolo = false
+function CM.soloDrop(line)
+	if not CM.warnedSolo then
+		CM.warnedSolo = true
+		log("inject: no peer in this session -- captures dropped ("
+			.. tostring(line):sub(1, 40) .. "...); single player is left to the engine")
+	end
+end
+
+-- FAR BEHIND, THE PLAYER'S ACTIONS ARE OFF (2026-09-15). A game further behind the
+-- fastest one than CM.MAX_LEAD (15 units) used to stamp its player's actions into
+-- the other games' past, where they applied late: a desync. Since 2026-09-26 every
+-- stamp lands in the fastest game's future however far behind we are (CM.scheduleLocal),
+-- so this gate is about the wait, not the desync: a click there would land only once
+-- this game has caught up. So past K.ACTIONS_OFF_BEHIND the
+-- player's actions are off until the game is back within K.ACTIONS_ON_BEHIND
+-- (CM.actionsBlockTick, every tick):
+--   * dropped: a capture whose native command the slice CANCELLED -- ARMED 1 ahead
+--     of it, or one the slice only writes once its cancel landed (CONXP, CONUP,
+--     CDEMO) -- and the GUI's own requests (calendar, companies). The action then
+--     happens on no game at all. A terraform or asset stroke's held tool lets go
+--     after the slice's 4 s safety valve.
+--   * held until caught up: a line creation (LCREATEX behind ARMED 1). The line
+--     editor's callback waits in the slice's stash for our own replay, and the next
+--     line created would take that stale callback; so it is replayed, and stamped,
+--     once the game has caught up.
+--   * still shipped: anything that already ran natively here (ARMED 0; EDEMO, whose
+--     bulldoze has applied; a construction's street companion, ROADC, which pairs or
+--     times out) -- dropping it would leave it on this game only -- and speed
+--     buttons, pauses and diagnostics.
+K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
+K.ACTIONS_ON_BEHIND = 2
+K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true,
+                         CMCOLOR = true }
+K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
+                        VREV = true, VSTOP = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
+                        STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true, TOWNC = true }
+CM.actionsOff = false
+CM.actionsHeld = {}   -- LCREATEX lines waiting for this game to catch up
+CM.behindBy = 0
+
+function CM.actionsBlockTick(now)
+	local fastT = now and CM.fastestPeerClock and CM.fastestPeerClock()
+	local behind = fastT and (fastT - now) or 0
+	CM.behindBy = behind
+	if not CM.actionsOff and behind > K.ACTIONS_OFF_BEHIND then
+		CM.actionsOff = true
+		log(string.format("ACTIONS OFF: this game is %.1f game units behind the fastest game (over %d) -- the player's actions are dropped until it is within %d",
+			behind, K.ACTIONS_OFF_BEHIND, K.ACTIONS_ON_BEHIND))
+	elseif CM.actionsOff and behind <= K.ACTIONS_ON_BEHIND then
+		CM.actionsOff = false
+		log(string.format("ACTIONS ON: %.1f game units behind -- the player's actions replicate again%s", behind,
+			#CM.actionsHeld > 0 and string.format("; %d held line creation(s) go out now", #CM.actionsHeld) or ""))
+	end
+end
+
+-- READ-ONLY FOREIGN WINDOWS EDIT GUARD (2026-09-16). The slice's `foreignwindows`
+-- patch lets a player OPEN another company's station/vehicle window. The depot and
+-- construction windows self-suppress their edit blocks for a foreign owner, but the
+-- vehicle and station-group windows have NO native owner gate: their rename / line /
+-- sell / send-to-depot / reverse / colour controls are live for any owner. So on the
+-- ORIGINATOR, before a captured edit is replicated, refuse it when its target entity
+-- is another company's -- the control becomes a harmless no-op that never ships, so
+-- the window is genuinely read-only and nothing can desync. Own entities (and coop)
+-- pass (cmForeignOwner is false there). Logged once per (op, entity).
+function CM.injForeignEdit(o, id)
+	if not id or not CM.cmForeignOwner then return false end
+	local foreign, cid = CM.cmForeignOwner(id)
+	if not foreign then return false end
+	CM.injForeignSaid = CM.injForeignSaid or {}
+	local k = tostring(o) .. ":" .. tostring(id)
+	if not CM.injForeignSaid[k] then
+		CM.injForeignSaid[k] = true
+		log(string.format("%s: entity %s belongs to company %s -- foreign window is read-only, not shipped", tostring(o), tostring(id), tostring(cid)))
+	end
+	return true
+end
+
+function CM.pollInject()
+	if not K.INJECT_FILE then return end
+	-- Companies: until this game's CMJOIN has landed (and its switch is done) no
+	-- machine knows which company our actions are for. The lines stay in the file
+	-- and are read once it has (companies.lua CM.cmHoldActions).
+	if CM.cmHoldActions and CM.cmHoldActions() then return end
+	local data, newOff = CM.readFrom(K.INJECT_FILE, CM.injectOffset)
+	CM.injectOffset = newOff
+	local carry = CM.injectCarry
+	CM.injectCarry = nil
+	-- line creations held while this game was far behind, due now that it has caught up
+	local release = not CM.actionsOff and #CM.actionsHeld > 0
+	if not data and not carry and not release then return end
+
+	local lines = {}
+	if carry then lines[1] = carry end
+	for line in (data or ""):gmatch("[^\r\n]+") do lines[#lines + 1] = line end
+	-- A clone's buy is two records: VBUY when the slice captures the command, then
+	-- VBUYLINE <line> when it reaches CommandList::Add a moment later. A VBUY that
+	-- ENDS a read may still have its VBUYLINE on the way, so it waits for the next
+	-- poll -- once: a poll with nothing new ships it as a plain buy.
+	if data and #lines > 0 and lines[#lines]:match("^%s*VBUY%s") then
+		CM.injectCarry = table.remove(lines)
+	end
+	-- The held line creations (CM.actionsBlockTick) go LAST, after this read's own
+	-- records, so a VBUY's VBUYLINE stays right behind it. Each is read as it was
+	-- written, behind ARMED 1, and the ARMED state is put back after it.
+	local heldFrom = #lines + 1
+	if release then
+		for _, held in ipairs(CM.actionsHeld) do lines[#lines + 1] = held end
+		CM.actionsHeld = {}
+	end
+
+	for li = 1, #lines do
+		local line = lines[li]
+		CM.injectNext = lines[li + 1]
+		local armedBefore = CM.lastArmed
+		if li >= heldFrom then CM.lastArmed = 1 end
+		line = line:gsub("^%s+", ""):gsub("%s+$", "")
+		if line ~= "" and line:sub(1, 1) ~= "#" then
+			local w = {}
+			for tok in line:gmatch("%S+") do w[#w + 1] = tok end
+			local o = w[1]
+			-- Same protection pollEvents has had all along: one malformed line
+			-- (or one bug in a parser branch) must cost that line, not the tick.
+			local okLine, errLine = pcall(function()
+			-- Diagnostics (EVAL, HEAL) always run; a CAPTURE is dropped
+			-- when nobody is playing with us, because the engine already built it.
+			-- Inside the per-line pcall on purpose: a `return` here skips THIS
+			-- line. Outside it, the first dropped capture abandoned every line
+			-- after it in the same read -- a diagnostic queued behind a build
+			-- never ran (review, 2026-08-31).
+			-- The slice says, per capture, whether it cancelled the local build.
+			if o == "ARMED" then CM.lastArmed = tonumber(w[2]) or 0; return end
+			-- NATIVE <kind>: in a live session the slice had to let a player build run
+			-- natively (its record did not decode, so it could not be cancelled). No
+			-- capture line carries it and nothing scans the world on a timer any more,
+			-- so one catch-up scan runs a few ticks from now, once the build has applied.
+			if o == "NATIVE" then
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
+				log("inject: the slice built a " .. tostring(w[2] or "?") .. " natively -- catch-up scan due")
+				return
+			end
+			-- read by the VBUY just ahead of it (CM.injectNext)
+			if o == "VBUYLINE" then return end
+			-- The street's bus lane and tram track, on their own line just ahead of
+			-- the ROADE (ROADE is positional and length-checked, so it cannot be
+			-- widened). Consumed by the next ROADE exactly as ARMED is.
+			if o == "STREETP" then
+				CM.lastStreetBus = tonumber(w[2]) or 0
+				CM.lastStreetTram = tonumber(w[3]) or 0
+				log(string.format("STREETP: hasBus=%s tramTrackType=%s",
+					tostring(CM.lastStreetBus), tostring(CM.lastStreetTram)))
+				return
+			end
+			-- FAR BEHIND: the player's actions are off (CM.actionsBlockTick, above)
+			if CM.actionsOff then
+				if o == "LCREATEX" and (CM.lastArmed or 0) == 1 then
+					CM.actionsHeld[#CM.actionsHeld + 1] = line
+					log(string.format("ACTIONS OFF: a line creation is held until this game catches up (%.1f game units behind)", CM.behindBy or 0))
+					return
+				end
+				if K.ACTIONS_OFF_ALWAYS[o] or (K.ACTIONS_OFF_ARMED[o] and (CM.lastArmed or 0) == 1) then
+					if o == "ROADE" then CM.lastStreetBus, CM.lastStreetTram = nil, nil end
+					if o == "CONXP" then
+						-- its ROADC (parked already: it precedes the CONXP in this
+						-- file) is released by serial instead of hunted for
+						local ps = tonumber((line:match("^(.-)%s+params=") or line):match("%sps=(%d+)"))
+						if ps then CM.droppedConxp = CM.droppedConxp or {}; CM.droppedConxp[ps] = true end
+					end
+					log(string.format("ACTIONS OFF: %s dropped -- this game is %.1f game units behind, so it happens on no game", o, CM.behindBy or 0))
+					return
+				end
+			end
+			-- A capture whose local build was CANCELLED must always be replayed,
+			-- peer or no peer -- dropping it deletes the player's own work.
+			if not CM.peerSeen and (CM.lastArmed or 0) == 0
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" and o ~= "CMCOLOR" then
+				CM.soloDrop(line)
+				return
+			end
+
+			-- ROADN n x0 y0 x1 y1 ...   (written by slice_hook from a captured
+			-- player build; carries every tessellated node)
+			if o == "CMNEW" or o == "CMSWITCH" or o == "CMDEL" or o == "CMPW" or o == "CMNAME" or o == "CMCOLOR" or o == "CMOPEN" then
+				-- the Multiplayer window's COMPANIES tab (GUI state) asked for a company
+				-- change: companies.lua CM.cmRequest checks it, hashes any password (the
+				-- clear text stays here) and schedules the command
+				CM.cmRequest(w)
+			elseif o == "HEAL" then
+				-- Manual repair: rejoin a road at x,y if a scar from a replayed
+				-- split is all that is left there. Same rules as the sweep.
+				CM.healNodeAt(tonumber(w[2]) or 0, tonumber(w[3]) or 0, "manual")
+
+			elseif o == "EVAL" then
+				-- Diagnostic probe: run a chunk from the inject file, log the
+				-- result. Exists so questions like "is the frozen mouth node in
+				-- node2StreetEdgeMap on B?" cost one file append, not a rebuild
+				-- cycle. loadstring may be sandboxed away; fail loudly then.
+				local chunk = line:sub(6)
+				local fn, cerr = (loadstring or load)(chunk)
+				if fn then
+					local okE, res = pcall(fn)
+					log("EVAL -> " .. tostring(res) .. (okE and "" or " (ERROR)"))
+				else
+					log("EVAL compile: " .. tostring(cerr))
+				end
+
+			elseif o == "DROPNEXT" then
+				-- TEST HOOK for the gap hold: the next command we issue is announced
+				-- (LSHI) and kept for resend, but its LSCMD is not sent -- every peer
+				-- should hold before its stamp, NACK it, get the resend and run on
+				CM.dropNextCmd = true
+				log("DROPNEXT: the next command's LSCMD will not be sent (gap hold test)")
+
+			elseif o == "SPEEDBTN" then
+				-- SPEEDBTN <v> <toggle|button>: a click on the clock's speed controls the slice
+				-- cancelled -- a speed button is our vote, the host's pause toggle pauses or resumes (CM.speedButton)
+				CM.speedButton(tonumber(w[2]), w[3])
+
+			elseif o == "SPEEDSET" then
+				-- the Multiplayer window's speed row (GUI state): our speed vote, fractions included (CM.guiSpeedSet)
+				CM.guiSpeedSet(tonumber(w[2]))
+
+			elseif o == "SETDATE" or o == "CALSPEED" then
+				-- the editor's date picker (a Julian day) or date speed slider (ms per
+				-- day), cancelled by the slice: scheduled like any command, so every
+				-- instance -- this one included -- applies it at the stamp (CM.execCalendar)
+				local v = tonumber(w[2])
+				if v then
+					CM.scheduleLocal(o, o == "SETDATE" and { jdn = v } or { ms = v })
+					log(string.format("%s %d: scheduled for every instance", o, v))
+				end
+
+			elseif o == "TERRAINCAP" then
+				-- a terraform or paint commit that applied here natively (CM.terrainCapture)
+				CM.terrainCapture(w)
+
+			elseif o == "ASSETCAP" then
+				-- an asset-brush stroke the slice cancelled (CM.assetCapture)
+				CM.assetCapture(w)
+
+			-- ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
+			--       <id x y z>*N <a1 a2 t0x t0y t0z t1x t1y t1z>*M
+			--       <rmnodeid>*rn <a1 a2 t0x t0y t0z t1x t1y t1z>*re
+			--       [<btype bidx>*M]
+			-- Carries real edge topology, so a road CONNECTING to existing
+			-- infrastructure replicates. Negative endpoints are the proposal's
+			-- own placeholders; positive ones are real entities in the world.
+			-- Removed EDGES are full 8-token records now (same shape ROADC uses),
+			-- which is what makes the UPGRADE tool (caller 4790fc: N=0 added nodes,
+			-- M added edges, M removed edges, every endpoint an existing node)
+			-- replicable at all -- see the rm list built below.
+			--
+			-- Converted here into a purely POSITIONAL command. This runs on the
+			-- originating peer, which still has every entity the capture refers
+			-- to, so a real node id can be turned into coordinates now -- and the
+			-- peer never has to trust that ids match, which nothing verified.
+			--
+			-- Split halves are DROPPED. When a road lands mid-span the game emits
+			-- both halves of the edge it cut, but the receiving peer regenerates
+			-- them by splitting its own copy; replaying the captured halves too
+			-- would duplicate them. A half is identified by shape: its new-node
+			-- endpoint is shared with another positive-endpoint edge.
+			elseif o == "ROADE" and #w >= 9 then
+				local n     = tonumber(w[2]) or 0
+				local etype = tonumber(w[3]) or 0
+				local stype = tonumber(w[4]) or 16
+				local ttype = tonumber(w[5]) or 1
+				local cat   = tonumber(w[6]) or 0
+				local m     = tonumber(w[7]) or 0
+				local rn    = tonumber(w[8]) or 0
+				local re    = tonumber(w[9]) or 0
+				-- n may be 0: an UPGRADE adds no nodes at all (it replaces edges
+				-- between nodes that already exist). Requiring n >= 1 is what made
+				-- an upgrade look like a malformed line.
+				-- rn / re are also floors, not just lengths: a negative count would
+				-- SHRINK the required width and then walk the bridge/tunnel tail off
+				-- into the removal records.
+				local ok = (n >= 0 and m >= 1 and rn >= 0 and re >= 0
+				            and #w >= 9 + n * 4 + m * 8 + rn + re * 8)
+
+				local posOf, order = {}, {}
+				if ok then
+					for i = 1, n do
+						local b = 9 + (i - 1) * 4
+						local id, x, y, z = tonumber(w[b + 1]), tonumber(w[b + 2]), tonumber(w[b + 3]), tonumber(w[b + 4])
+						if not (id and x and y and z) then ok = false; break end
+						-- z from the CAPTURE, not the terrain: bridges and embankments
+						-- are not at ground level.
+						posOf[id] = { x, y, z }
+						order[#order + 1] = id
+					end
+				end
+
+				local raw = {}
+				if ok then
+					local b = 9 + n * 4
+					for i = 1, m do
+						local o = b + (i - 1) * 8
+						local a1, a2 = tonumber(w[o + 1]), tonumber(w[o + 2])
+						if not (a1 and a2) then ok = false; break end
+						local t = {}
+						for k = 1, 6 do
+							t[k] = tonumber(w[o + 2 + k])
+							if not t[k] then ok = false; break end
+						end
+						if not ok then break end
+						raw[#raw + 1] = { a1, a2, t, 0, -1 }
+					end
+				end
+				-- Removed EDGES, 8-token records like the added ones. Only the two
+				-- endpoint ids are used (the removal is named by POSITION on the
+				-- wire); the tangents are consumed to keep the offsets right.
+				local rmv = {}
+				if ok then
+					local b = 9 + n * 4 + m * 8 + rn
+					for i = 1, re do
+						local o = b + (i - 1) * 8
+						local a1, a2 = tonumber(w[o + 1]), tonumber(w[o + 2])
+						if not (a1 and a2) then ok = false; break end
+						rmv[#rmv + 1] = { a1, a2 }
+					end
+				end
+				if ok and CM.cmMayReplaceEdges and not CM.cmMayReplaceEdges(rmv, etype == 1) then
+					ok = false
+					log("ROADE: refused change to foreign or unresolved infrastructure")
+				end
+				-- Bridge/tunnel tail: <type idx> per added edge, appended AFTER the
+				-- legacy payload (old captures simply lack it -> ground).
+				if ok then
+					local tb = 9 + n * 4 + m * 8 + rn + re * 8
+					if #w >= tb + m * 2 then
+						for i = 1, m do
+							raw[i][4] = tonumber(w[tb + (i - 1) * 2 + 1]) or 0
+							raw[i][5] = tonumber(w[tb + (i - 1) * 2 + 2]) or -1
+						end
+					end
+					local ob = tb + m * 2
+					if w[ob + 1] == "OWNERS" then
+						assert(#w == ob + 1 + m, "ROADE: incomplete ownership tail")
+						for i = 1, m do raw[i][6] = CM.edgeOwnerCompany(tonumber(w[ob + 1 + i])) end
+					end
+				end
+
+				if ok then
+					-- Which new nodes are SPLIT points, vs bridge midpoints?
+					--
+					-- The old test -- "a new node with >=2 positive-endpoint edges"
+					-- -- was wrong. A road that BRIDGES two existing road ends
+					-- through a new midpoint gives that midpoint two
+					-- positive-endpoint edges too, with NO split, so both edges
+					-- were dropped as "halves" and the road vanished (the triangle
+					-- closing edge failed exactly this way).
+					--
+					-- The real discriminator is GEOMETRY: a split point lies ON an
+					-- existing edge; a bridge midpoint sits in open space. The
+					-- originator has cancelled its build, so the original edges are
+					-- intact in its world -- findEdgeContaining answers directly.
+					local isTrack = (etype == 1)
+					local splitNode = {}   -- new node id -> { node0, node1 } of the edge it sits on
+					-- ONE geometry scope for this split scan AND the plan pass below
+					-- (closed where this block ends; pollInject also closes any scope a
+					-- line leaves open). Unscoped, every new node walked the whole track
+					-- map and then the whole street map, reading every edge's geometry:
+					-- up to 20 full walks for a 10-node tunnel, ~1 s of freeze at the
+					-- click on top of the 268 ms plan (2026-09-10). Nothing changes the
+					-- world between here and the plan -- the build was cancelled.
+					CM.geomScopeBegin()
+					local scanT0 = os.clock()
+					for id, xyz in pairs(posOf) do
+						local hitEid, hitU
+						-- EITHER kind: a rail vertex landing on a ROAD is a split point too
+						-- (level crossing). Same-kind only let the road's halves through as
+						-- rail edges -> duplicated, track-typed road halves in the proposal
+						-- -> "Construction not possible" (proposal dump 2026-08-29).
+						pcall(function() hitEid, hitU = CM.findEdgeContaining(isTrack, xyz[1], xyz[2]) end)
+						if not hitEid then pcall(function() hitEid, hitU = CM.findEdgeContaining(not isTrack, xyz[1], xyz[2]) end) end
+						-- An edge well above or below the vertex is not split by it: a road vertex
+						-- under a BRIDGE is inside the bridge's footprint in plan view only. Taken
+						-- as a split, the bridge span the engine replaced in place counted as a
+						-- split parent and its removal was not shipped (2026-09-12). A real split
+						-- point normally sits on the edge's surface. Keep the 2.5 m guard
+						-- except for an explicitly captured pair of ground-road split halves:
+						-- the native crossing tool can move that road to the rail's height.
+						if hitEid and CM.edgeZAt then
+							local ez
+							pcall(function() ez = CM.edgeZAt(hitEid, hitU) end)
+							local maxDz = CM.captureSplitHeightLimit and CM.captureSplitHeightLimit(isTrack, hitEid, id, raw) or 2.5
+							if ez and math.abs(ez - xyz[3]) > maxDz then hitEid = nil end
+						end
+						if hitEid then
+							local ends = { -1, -1 }
+							pcall(function()
+								local be = api.engine.getComponent(hitEid, api.type.ComponentType.BASE_EDGE)
+								if be then ends = { be.node0, be.node1 } end
+							end)
+							splitNode[id] = ends
+						end
+					end
+
+					local scanMs = math.floor((os.clock() - scanT0) * 1000 + 0.5)
+
+					-- Resolve a real entity id to a position, on this peer, now.
+					local function realPos(id)
+						local p
+						pcall(function()
+							local nc = api.engine.getComponent(id, api.type.ComponentType.BASE_NODE)
+							if nc and nc.position then
+								p = { nc.position.x or nc.position[1],
+								      nc.position.y or nc.position[2],
+								      nc.position.z or nc.position[3] }
+							end
+						end)
+						return p
+					end
+
+					local pts, links, tans, index, bts = {}, {}, {}, {}, {}
+					local function pointFor(key, xyz)
+						if index[key] then return index[key] end
+						pts[#pts + 1] = string.format("%.4f", xyz[1])
+						pts[#pts + 1] = string.format("%.4f", xyz[2])
+						pts[#pts + 1] = string.format("%.4f", xyz[3])
+						index[key] = #pts / 3
+						return index[key]
+					end
+
+					-- Building below a bridge may include the unchanged bridge span in
+					-- the native capture. ROADE has one network kind for the whole build:
+					-- treating that rail span as another STREET creates a duplicate with
+					-- the wrong kind and bridge model, rejecting the entire proposal.
+					-- Carry a proven unchanged opposite-network bridge separately so the
+					-- replay replaces it with its own type and lets the engine update its
+					-- supports. Simply omitting it leaves a bridge collision. Changed geometry
+					-- and another bridge model stay here.
+					-- A span of the command's OWN network is refreshed the same way: a road built
+					-- under a road bridge (capture #36, 2026-09-12). Shipped as a link it replayed
+					-- with the NEW road's street type, so the bridge changed type on every
+					-- instance; carried like the other network's span it keeps its own. It
+					-- travels as bs, the same record as br. An upgrade replaces spans between
+					-- existing nodes on purpose, so a capture in which every edge replaces a
+					-- removal keeps its own network's spans explicit.
+					-- The slice also SHIPS a refreshed span's removal (a removal and an add
+					-- between the same two existing nodes: the road-under-bridge fix,
+					-- 2026-09-12). A companion carries that removal itself (companionPair), so
+					-- it is not shipped in rm as well -- rm is matched in the command's own
+					-- network only, and two removals of one edge reject the whole proposal.
+					local companionPair = {}
+					local owners = {}
+					local function pairKey(a, b) return (a < b) and (a .. ":" .. b) or (b .. ":" .. a) end
+					local upgradeShape = #raw > 0
+					do
+						local replaced = {}
+						for _, r in ipairs(rmv) do replaced[pairKey(r[1], r[2])] = true end
+						for _, e in ipairs(raw) do
+							if e[1] < 0 or e[2] < 0 or not replaced[pairKey(e[1], e[2])] then upgradeShape = false; break end
+						end
+					end
+					-- is e the existing bridge between its two nodes in network `track`, unchanged?
+					local function unchangedBridgeIn(e, track)
+						local a, b = e[1], e[2]
+						local map = CM.netMap(track)
+						for _, eid in pairs((map and map[a]) or {}) do
+							local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+							if be and be.type == 1 and be.typeIndex == e[5] then
+								local forward = be.node0 == a and be.node1 == b
+								local reverse = be.node0 == b and be.node1 == a
+								if forward or reverse then
+									local t0 = forward and be.tangent0 or be.tangent1
+									local t1 = forward and be.tangent1 or be.tangent0
+									local sign = forward and 1 or -1
+									local ts = { t0.x, t0.y, t0.z, t1.x, t1.y, t1.z }
+									local same = true
+									for k = 1, 6 do
+										if math.abs(sign * ts[k] - e[3][k]) > 0.0001 then same = false; break end
+									end
+									if same then return true end
+								end
+							end
+						end
+						return false
+					end
+					-- "br" (the other network's span), "bs" (the command's own), or nil
+					local function bridgeCompanion(e)
+						if e[1] < 0 or e[2] < 0 or e[4] ~= 1 then return nil end
+						if unchangedBridgeIn(e, not isTrack) then return "br" end
+						if not upgradeShape and unchangedBridgeIn(e, isTrack) then return "bs" end
+						return nil
+					end
+					local dropped, bridges, sameBridges = 0, {}, {}
+					local halfNode = {}   -- new node -> true: the engine split an existing edge there
+					for _, e in ipairs(raw) do
+						local a1, a2 = e[1], e[2]
+						-- A split half is an edge from an existing node to a new
+						-- node that sits on an existing edge; the peer regenerates
+						-- it by splitting its own copy. A bridge edge touches a new
+						-- node in open space and must be kept.
+						-- A half runs from the split node to one of the ENDPOINTS of the
+						-- edge it splits. Any other existing->new edge is a CONNECTOR: a
+						-- track MERGING from an existing node onto a bridge mid-span
+						-- (2026-08-29: '281946 -> -1' plus the two halves) was dropped as
+						-- a third half -> "no usable edges" -> nothing built anywhere.
+						local function isHalfOf(ex, nw)
+							local ends = splitNode[nw]
+							return ends ~= nil and (ex == ends[1] or ex == ends[2])
+						end
+						local isHalf = (a1 >= 0 and a2 < 0 and isHalfOf(a1, a2))
+						                or (a2 >= 0 and a1 < 0 and isHalfOf(a2, a1))
+						local companion = bridgeCompanion(e)
+						if companion then
+							companionPair[pairKey(a1, a2)] = true
+							local p1, p2 = realPos(a1), realPos(a2)
+							assert(p1 and p2, "bridge companion endpoints disappeared")
+							local list = (companion == "br") and bridges or sameBridges
+							list[#list + 1] = string.format("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d",
+								p1[1], p1[2], p1[3], p2[1], p2[2], p2[3], e[5])
+						elseif isHalf then
+							dropped = dropped + 1
+							halfNode[(a1 < 0) and a1 or a2] = true
+						else
+							local p1 = (a1 < 0) and posOf[a1] or realPos(a1)
+							local p2 = (a2 < 0) and posOf[a2] or realPos(a2)
+							if p1 and p2 then
+								local i1 = pointFor(a1, p1)
+								local i2 = pointFor(a2, p2)
+								if i1 ~= i2 then
+									links[#links + 1] = tostring(i1)
+									links[#links + 1] = tostring(i2)
+									-- the captured tangents, so curves stay curves
+									for k = 1, 6 do
+										tans[#tans + 1] = string.format("%.4f", e[3][k])
+									end
+									bts[#bts + 1] = tostring(e[4] or 0)
+									bts[#bts + 1] = tostring(e[5] or -1)
+									if e[6] ~= nil then owners[#owners + 1] = tostring(e[6]) end
+								end
+							end
+						end
+					end
+
+					-- Which new nodes did the originator's engine attach to an existing
+					-- edge? Exactly those with a dropped half. Every other new node it
+					-- left a plain node, and the replay must not split or snap it onto an
+					-- edge it merely runs beside: a parallel track's vertex 4.6 m off a
+					-- road's centreline near its end counted as "on" the road, snapped to
+					-- the road's end node, lost its rail edge in the same-pair dedup, and
+					-- the build failed critical on every instance (2026-09-11, seq 328/329).
+					local freshV = {}
+					for id in pairs(posOf) do
+						if not halfNode[id] and index[id] then freshV[#freshV + 1] = index[id] end
+					end
+					table.sort(freshV)
+
+					-- ---------- removals -> positional rm list ----------
+					--
+					-- Only removals the peer CANNOT regenerate travel. A removal
+					-- whose two endpoints are the ends of the edge some new node
+					-- sits on is a SPLIT PARENT: execPolyline splits its own copy of
+					-- that edge and removes it there, so shipping the removal too
+					-- would remove one entity twice and the engine rejects the whole
+					-- proposal. What is left is the UPGRADE case -- an edge replaced
+					-- in place between two existing nodes, invisible to any
+					-- geometric test the peer could run.
+					--
+					-- The build was CANCELLED here, so every id in the capture still
+					-- resolves; positions are read now and ids never leave.
+					local rmpos, rmbad, rmskip, rmcomp = {}, nil, 0, 0
+					for _, r in ipairs(rmv) do
+						local isSplitParent = false
+						for _, ends in pairs(splitNode) do
+							if (ends[1] == r[1] and ends[2] == r[2])
+							   or (ends[1] == r[2] and ends[2] == r[1]) then
+								isSplitParent = true
+								break
+							end
+						end
+						if isSplitParent then
+							rmskip = rmskip + 1
+						elseif companionPair[pairKey(r[1], r[2])] then
+							rmcomp = rmcomp + 1
+						else
+							local q1 = (r[1] < 0) and posOf[r[1]] or realPos(r[1])
+							local q2 = (r[2] < 0) and posOf[r[2]] or realPos(r[2])
+							if q1 and q2 then
+								rmpos[#rmpos + 1] = string.format("%.4f,%.4f,%.4f,%.4f",
+									q1[1], q1[2], q2[1], q2[2])
+							else
+								rmbad = string.format("removed edge %d->%d has no resolvable "
+									.. "endpoint position on this instance", r[1], r[2])
+								break
+							end
+						end
+					end
+
+					if rmbad then
+						-- Ship nothing. An upgrade whose removal is missing replays as
+						-- a pure ADD on the peer: a second edge between the same two
+						-- nodes, permanently diverged.
+						log("ROADE: " .. rmbad .. " -- command NOT replicated")
+					elseif #links >= 2 then
+						if dropped > 0 then
+							log(string.format("ROADE: dropped %d split half/halves " ..
+								"-- the peer regenerates them locally", dropped))
+						end
+						if #bridges > 0 then
+							log(string.format("ROADE: preserved %d opposite-network bridge replacement(s)", #bridges))
+						end
+						if #sameBridges > 0 then
+							log(string.format("ROADE: preserved %d same-network bridge replacement(s) with their own properties", #sameBridges))
+						end
+						if rmcomp > 0 then
+							log(string.format("ROADE: %d in-place removal(s) from the slice travel with those replacements, not in rm", rmcomp))
+						end
+						if #rmpos > 0 or rmskip > 0 then
+							log(string.format("ROADE: %d removal(s) shipped as positions, "
+								.. "%d left to the peer's own split", #rmpos, rmskip))
+						end
+						local sargs = { pts = table.concat(pts, ","),
+						                links = table.concat(links, ","),
+						                tans = table.concat(tans, ","),
+						                bt = table.concat(bts, ","),
+						                etype = etype, stype = stype, ttype = ttype,
+						                cat = cat }
+						-- omitted entirely when there is nothing to remove: an empty
+						-- 'rm=' token would not survive decodeCmd's key=value scan
+						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
+						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
+						if #bridges > 0 then sargs.br = table.concat(bridges, ";") end
+						if #sameBridges > 0 then sargs.bs = table.concat(sameBridges, ";") end
+						if #owners > 0 then sargs.own = table.concat(owners, ",") end
+						-- carry the bus lane / tram track the slice just decoded, so an
+						-- upgrade that ADDS either one actually reaches the peers (and the
+						-- originator, whose own upgrade was cancelled)
+						if CM.lastStreetBus then sargs.bus = CM.lastStreetBus end
+						if CM.lastStreetTram then sargs.tram = CM.lastStreetTram end
+						CM.lastStreetBus, CM.lastStreetTram = nil, nil
+						-- Decide HERE, once, and put the decisions on the wire.
+						-- This runs the real replay in plan-only mode: same
+						-- resolution, same splits, nothing built. Both instances
+						-- then execute the originator's answer at the stamp instead
+						-- of each re-deriving one against its own world.
+						local planT0 = os.clock()
+						local okPlan, xv, xh = pcall(function()
+							return CM.execPolyline({ pts = sargs.pts, links = sargs.links,
+								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
+								stype = sargs.stype, ttype = sargs.ttype, cat = sargs.cat,
+								rm = sargs.rm, fv = sargs.fv, br = sargs.br, bs = sargs.bs, seq = "plan" }, true)
+						end)
+						if okPlan then
+							-- pcall folds multiple returns; re-run shape: xv is the
+							-- first value, xh the second (nil when there is nothing).
+							if xv then sargs.xv = xv end
+							if xh then sargs.xh = xh end
+							local function entries(str)
+								local n = 0
+								for _ in tostring(str or ""):gmatch("[^;]+") do n = n + 1 end
+								return n
+							end
+							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped (%d ms at the click, split scan %d ms before it)",
+								entries(xv), entries(xh), math.floor((os.clock() - planT0) * 1000 + 0.5), scanMs))
+						else
+							log("ROADP plan pass failed (" .. tostring(xv) .. ") -- peers will derive their own")
+						end
+						-- Not cancelled here (no live session at the time): the engine
+						-- built it natively, so this instance must not replay it.
+						if (CM.lastArmed or 1) == 0 then sargs.skipOrigin = 1 end
+						CM.scheduleLocal("ROADP", sargs)
+					else
+						log("inject: ROADE produced no usable edges: " .. line:sub(1, 70))
+					end
+					CM.geomScopeEnd()
+				else
+					log("inject: bad ROADE line: " .. line:sub(1, 70))
+				end
+			elseif o == "CONUP" and #w >= 4 then
+				-- A CANCELLED construction upgrade: the old
+				-- entity id and the new CE's file/params, walked off the proposal.
+				-- The entity still stands (the upgrade was cancelled), so resolve
+				-- it to its position here; strict=1 makes execConU run on this
+				-- instance too, and every instance upgrades at the stamp.
+				local oldId = tonumber(w[2])
+				local cfile = w[3]
+				local tstr = tostring(w[4] or ""):match("^t=(.*)$")
+				local pstr = line:match("params=(.*)$") or "{}"
+				local ct = {}
+				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
+				local x, y
+				pcall(function()
+					if oldId and api.engine.entityExists(oldId) then
+						local co = api.engine.getComponent(oldId, api.type.ComponentType.CONSTRUCTION)
+						if co and co.transf then x, y = co.transf[13], co.transf[14] end
+					end
+				end)
+				if not x and #ct == 16 then x, y = ct[13], ct[14] end
+				if CM.cmMayModify and not CM.cmMayModify(oldId) then
+					log("CONUP: refused change to foreign or unresolved construction")
+				elseif cfile and x and y then
+					-- Ship the DIFF against the entity as it stands NOW (see CM.conDiff):
+					-- the proposal was built from this same entity, so the difference
+					-- is exactly this click. Falls back to the full set if the entity
+					-- cannot be read (then rapid clicks may overwrite each other).
+					local diffStr, nset, ndel
+					pcall(function()
+						local e = oldId and game.interface.getEntity(oldId)
+						local p1 = CM.deserParams(pstr)
+						if e and e.params and p1 then
+							local d = CM.conDiff(e.params, p1)
+							nset, ndel = 0, 0
+							for _ in pairs(d.mset) do nset = nset + 1 end
+							for _ in pairs(d.mdel) do ndel = ndel + 1 end
+							diffStr = CM.ser(d)
+						end
+					end)
+					if diffStr then
+						CM.scheduleLocal("CONU", { file = cfile, x = x, y = y, params = diffStr, diff = 1, strict = 1 })
+						log(string.format("CONUP: cancelled upgrade of %d (%s at %.1f,%.1f): diff %d module(s) set, %d removed -- every instance applies it at the stamp",
+							oldId or -1, cfile, x, y, nset, ndel))
+					else
+						CM.scheduleLocal("CONU", { file = cfile, x = x, y = y, params = pstr, strict = 1 })
+						log(string.format("CONUP: cancelled upgrade of %d (%s at %.1f,%.1f) -- entity unreadable, shipping the FULL set (rapid clicks may overwrite)", oldId or -1, cfile, x, y))
+					end
+				else
+					log("inject: bad CONUP line: " .. line:sub(1, 70))
+				end
+			elseif o == "STOPX" and #w >= 10 then
+			-- A CANCELLED stop / signal / waypoint placement:
+			-- decoded off the tool's PROPOSAL by the slice (StashStopFromProposal) and
+			-- written only once the cancel landed, ARMED 1 ahead of it. The native
+			-- build never happened, so the edge id is still ours and the object stands
+			-- nowhere yet. Ships the SAME STOPADD the poll would have -- minus
+			-- skipOrigin: every instance, this one included, replays it through
+			-- nativeStopProposal at the stamp.
+			--
+			-- Side: `left` is the ENGINE's byte straight off the record, shipped as
+			-- eleft with our tangent at the object (tx,ty); a peer flips it only when
+			-- ITS matched edge runs the other way. That is exact for an on-centreline
+			-- object too. The poll path could not do this for a track object -- the
+			-- engine byte is not readable off a built signal -- and its geometric
+			-- fallback built signals facing the wrong way (2026-09-08).
+			local eid, kind, mid = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
+			local x, y = tonumber(w[5]), tonumber(w[6])
+			local engLeft, oneWay = tonumber(w[8]) == 1, tonumber(w[9]) == 1
+			local name = line:match("name=(.*)$") or ""
+			if (CM.lastArmed or 0) ~= 1 then
+				log("STOPX: not armed -- the native build stands, a catch-up scan captures it")
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
+			elseif eid and kind and mid and x and y then
+				local ok2, why = pcall(function()
+					local comp, a, b, ta, tb = CM.edgeGeomT(eid)
+					if not comp then error("edge " .. tostring(eid) .. " is not here") end
+					local u = CM.uOnEdgeFine(eid, x, y) or CM.uOnEdge(eid, x, y) or 0.5
+					local q = CM.hermitePos(a, ta, b, tb, u)
+					local t = CM.hermiteTangent(a, ta, b, tb, u)
+					local tl = math.sqrt(t[1] * t[1] + t[2] * t[2])
+					if tl < 1e-6 then error("degenerate tangent on edge " .. tostring(eid)) end
+					local geoLeft = (t[1] * (y - q[2]) - t[2] * (x - q[1])) > 0
+					local model = api.res.modelRep.getName(mid)
+					if not model or model == "" then error("model " .. tostring(mid) .. " has no name") end
+					local isTrack = false
+					pcall(function() isTrack = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
+					local stname = ""
+					pcall(function()
+						local sc = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+						if sc then stname = api.res.streetTypeRep.getName(sc.streetType) or "" end
+					end)
+					-- side as the poll encodes it: STOP_LEFT=0 / STOP_RIGHT=1 / track object=2
+					local wside = kind == 2 and 2 or (engLeft and 0 or 1)
+					local fields = {
+						ax = a[1], ay = a[2], bx = b[1], by = b[2],
+						u = u, left = geoLeft and 1 or 0, side = wside, conv = (engLeft == geoLeft) and 1 or 0,
+						eleft = engLeft and 1 or 0, tx = t[1] / tl, ty = t[2] / tl,
+						x = x, y = y, kind = kind == 2 and 2 or 1, track = isTrack and 1 or 0,
+						oneWay = oneWay and 1 or 0, stname = CM.escName(stname),
+						model = CM.escName(model), name = CM.escName(name), cancelled = 1 }
+					-- COMPANIES: a click on a side another company's stop holds would replace
+					-- it (CM.execStopAdd's one-click replace). The placement was cancelled
+					-- natively, so refusing here changes nothing anywhere.
+					local takenBy, takenCid = nil, nil
+					if CM.cmStopSideForeign then takenBy, takenCid = CM.cmStopSideForeign(eid, wside) end
+					if takenBy then
+						log(string.format("STOPX: side %d of edge %d holds company %s's stop %d -- REFUSED, a company cannot replace another company's stop",
+							wside, eid, tostring(takenCid or "?"), takenBy))
+						pcall(CM.cmNote, string.format("That side of the road holds company %s's stop -- you cannot replace it", tostring(takenCid or "?")))
+						return
+					end
+					if CM.autoSigCapture then CM.autoSigCapture(fields) end
+					CM.scheduleLocal("STOPADD", fields)
+					log(string.format("STOPX: cancelled %s '%s' on edge %d u=%.3f engine-left=%s geo-left=%s side=%d%s -> STOPADD (strict, every instance replays)",
+						model, name, eid, u, tostring(engLeft), tostring(geoLeft), wside, oneWay and " one-way" or ""))
+				end)
+				if not ok2 then
+					-- the native build is already gone: the placement is lost on EVERY
+					-- instance alike (no divergence) -- say so, the player re-places it
+					log("STOPX: " .. tostring(why) .. " -- DROPPED, the cancelled placement is lost everywhere; place it again")
+				end
+			else
+				log("inject: bad STOPX line: " .. line:sub(1, 70))
+			end
+
+			elseif o == "CONXP" and #w >= 3 then
+				-- The construction HALF of a CANCELLED placement: its params walked
+				-- off the PROPOSAL by the
+				-- slice (StashConxpFromProposal) and written only once the cancel
+				-- landed. There is no entity to poll -- the native build never
+				-- happened -- so this takes the seat the entity poll would have
+				-- filled in pendingCons and pairs with its ROADC like any capture.
+				-- name is derived (ce.name must be non-empty: it names and owns the
+				-- child depot entity); cost/bal are nil (every instance pays the same
+				-- scripted cost at the stamp, so the COOP snap is skipped); survivors
+				-- is the PRE-build set (all three run the identical scripted build, so
+				-- the survivor-diff is a no-op). cancelled=1 makes the originator's
+				-- execConX build like a peer instead of bulldoze-and-rebuild.
+				local cfile = w[2]
+				local tstr = tostring(w[3] or ""):match("^t=(.*)$")
+				local pstr = line:match("params=(.*)$") or "{}"
+				-- ps=<serial> rc=<0|1> sit between t= and params=: the placement
+				-- serial its ROADC carries (identity, cons.lua CM.flushConPairs) and
+				-- whether the slice wrote a ROADC for it at all
+				local head = line:match("^(.-)%s+params=") or line
+				local ps = tonumber(head:match("%sps=(%d+)"))
+				local hadRoadc = tonumber(head:match("%src=(%d)"))
+				local ct = {}
+				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
+				if cfile and #ct == 16 then
+					if CM.fencesCapture and CM.fencesCapture(cfile,ct,pstr,hadRoadc) then return end
+					-- Name is generated at BUILD time (execConX -> CM.depotName): the
+					-- engine auto-names a native placement "<town> Road depot", which
+					-- a script buildProposal does not, so we reproduce it from the
+					-- nearest town + a duplicate "#N" suffix, deterministic on the
+					-- synced world. c.name here is only the fallback if that fails.
+					local base = cfile:match("([^/]+)%.con$") or "construction"
+					CM.pendingCons[#CM.pendingCons + 1] = { at = CM.gameTime() or 0, file = cfile, t = tstr, params = pstr,
+						name = CM.escName(base), x = ct[13], y = ct[14], id = nil,
+						survivors = CM.gatherSurvivors(ct[13], ct[14], nil), cancelled = 1,
+						ps = ps, hadRoadc = hadRoadc }
+					log(string.format("CONXP: cancelled placement %s at (%.1f,%.1f) ps=%s rc=%s params=%s -- parked for pairing",
+						cfile, ct[13], ct[14], tostring(ps), tostring(hadRoadc), pstr:sub(1, 100)))
+				else
+					log("inject: bad CONXP line: " .. line:sub(1, 70))
+				end
+			elseif o == "ROADC" and #w >= 8 then
+				-- Street companion of a construction placement (hook caller 419f62).
+				-- Classification is ID-ANCHORED, never world-resolved: by the time
+				-- this line is read the placement has APPLIED, and the apply
+				-- recycles node ids (measured: removed-edge endpoint 217763 was
+				-- already dead at conversion time) -- so any test that resolves a
+				-- captured id against the live world silently misclassifies.
+				--   split point -- a new node with added edges to BOTH endpoints of
+				--                  one removed edge; those two edges are HALVES.
+				--                  Peer regenerates the split, so drop them and ship
+				--                  the split position as a WELD instead.
+				--   frozen stub -- both endpoints new, neither a split point;
+				--                  buildConstruction creates it on the peer. Drop.
+				--   connector   -- everything else: mouth-to-street. Ship.
+				local n     = tonumber(w[2]) or 0
+				local etype = tonumber(w[3]) or 0
+				local stype = tonumber(w[4]) or 16
+				local ttype = tonumber(w[5]) or 1
+				local cat   = tonumber(w[6]) or 0
+				local m     = tonumber(w[7]) or 0
+				local re    = tonumber(w[8]) or 0
+				local ok = (m >= 1 and #w >= 8 + n * 4 + m * 8 + re * 8)
+				local posOf = {}
+				if ok then
+					for i = 1, n do
+						local b = 8 + (i - 1) * 4
+						local id, x, y, z = tonumber(w[b + 1]), tonumber(w[b + 2]),
+						                    tonumber(w[b + 3]), tonumber(w[b + 4])
+						if not (id and x and y and z) then ok = false; break end
+						posOf[id] = { x, y, z }
+					end
+				end
+				local function rec8(base, i)
+					local o8 = base + (i - 1) * 8
+					local a1, a2 = tonumber(w[o8 + 1]), tonumber(w[o8 + 2])
+					if not (a1 and a2) then return nil end
+					local t = {}
+					for k = 1, 6 do
+						t[k] = tonumber(w[o8 + 2 + k])
+						if not t[k] then return nil end
+					end
+					return { a1, a2, t }
+				end
+				local adds, rms = {}, {}
+				if ok then
+					for i = 1, m do
+						local r = rec8(8 + n * 4, i)
+						if not r then ok = false; break end
+						adds[#adds + 1] = r
+					end
+				end
+				if ok then
+					for i = 1, re do
+						local r = rec8(8 + n * 4 + m * 8, i)
+						if not r then ok = false; break end
+						rms[#rms + 1] = r
+					end
+				end
+				-- Bridge/tunnel tail: <type idx> per ADDED edge after the legacy payload.
+				if ok then
+					local tb = 8 + n * 4 + m * 8 + re * 8
+					for i = 1, m do
+						adds[i][4], adds[i][5] = 0, -1
+						if #w >= tb + m * 2 then
+							adds[i][4] = tonumber(w[tb + (i - 1) * 2 + 1]) or 0
+							adds[i][5] = tonumber(w[tb + (i - 1) * 2 + 2]) or -1
+						end
+					end
+				end
+				-- Placement serial, ps=<n> after the tail: the identity the CONXP of
+				-- the same placement carries. Absent from a slice older than 2026-09-16.
+				local ps
+				for i = 9, #w do
+					local v = tostring(w[i]):match("^ps=(%d+)$")
+					if v then ps = tonumber(v) end
+				end
+				if ok then
+					-- No classification here any more: the whole street payload
+					-- replays natively on the peer (CONX). Positive ids that still
+					-- resolve get their positions attached for the peer's node
+					-- lookup; the removed edge's endpoints are mapped peer-side.
+					local spos = {}
+					for _, e in ipairs(adds) do
+						for k = 1, 2 do
+							local id = e[k]
+							if id >= 0 and not spos[id] then
+								pcall(function()
+									local nc = api.engine.getComponent(id, api.type.ComponentType.BASE_NODE)
+									if nc and nc.position then
+										spos[id] = { nc.position.x or nc.position[1],
+										             nc.position.y or nc.position[2],
+										             nc.position.z or nc.position[3] }
+									end
+								end)
+							end
+						end
+					end
+					CM.pendingRoadc[#CM.pendingRoadc + 1] = { at = CM.gameTime() or 0, posOf = posOf,
+						adds = adds, rms = rms, spos = spos, etype = etype, stype = stype,
+						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll, ps = ps }
+					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals, ps=%s) for pairing",
+						n, #adds, #rms, tostring(ps)))
+				else
+					-- its CONXP (same ps) will be REFUSED for want of this payload: say which
+					log("inject: bad ROADC line (ps=" .. tostring(ps) .. "): " .. line:sub(1, 70))
+				end
+
+			elseif (o == "VBUY" or o == "VREPL") and #w >= 3 then
+				-- A player's BuyVehicle or ReplaceVehicle, from the hook. Convert
+				-- NOW, on this instance, while the ids still mean something: depot
+				-- id -> position + file, vehicle id -> cross-peer key, model ids ->
+				-- file names.
+				--
+				--   VBUY  <depotChild>    <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--   VREPL <vehicleEntity> <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--
+				-- rev is the part's reversed flag (0/1): a turned wagon, an ICE's
+				-- tail head. It travels to the peers as the part spec's fifth field.
+				--
+				-- The config encoding is byte-identical after the first field, so
+				-- both ops share this parser: two copies of it drifted apart the
+				-- moment one of them learned about vehicleGroups.
+				local depot = tonumber(w[2])   -- VBUY: the depot child; VREPL: the vehicle
+				local n = tonumber(w[3]) or 0
+				local i = 4
+				local parts, ok = {}, (depot ~= nil and n >= 1)
+				for k = 1, n do
+					if not ok then break end
+					local model, rev, nl = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
+					if not (model and rev and nl) then ok = false; break end
+					i = i + 3
+					local loads = {}
+					for j = 1, nl do loads[j] = tonumber(w[i]) or 0; i = i + 1 end
+					local r, g, b = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
+					i = i + 3
+					local na = tonumber(w[i]) or 0
+					i = i + 1
+					local autos = {}
+					for j = 1, na do autos[j] = tonumber(w[i]) or 0; i = i + 1 end
+					if not (r and g and b) then ok = false; break end
+					-- the slice copies autoLoadConfig's packed vector<bool> words; the wire
+					-- carries one 0/1 per load slot (CM.autoLoadFlags, vehicles.lua)
+					if CM.autoLoadFlags then autos = CM.autoLoadFlags(autos, nl) end
+					parts[#parts + 1] = { model = model, rev = (rev ~= 0) and 1 or 0, loads = loads, color = { r, g, b }, autos = autos }
+				end
+				local ng = tonumber(w[i]) or 0
+				i = i + 1
+				local groups = {}
+				for j = 1, ng do groups[j] = tonumber(w[i]) or 0; i = i + 1 end
+				if ok and #parts >= 1 then
+					-- Model ids are per-instance resource indices; the wire carries
+					-- file names. Encoded once here for whichever op we are in.
+					local enc = {}
+					for _, p in ipairs(parts) do
+						local name
+						pcall(function() name = api.res.modelRep.getName(p.model) end)
+						if type(name) ~= "string" or name == "" then name = "#" .. p.model end
+						enc[#enc + 1] = table.concat({ name,
+							table.concat(p.loads, "/"),
+							string.format("%.4f,%.4f,%.4f", p.color[1], p.color[2], p.color[3]),
+							table.concat(p.autos, "/"),
+							tostring(p.rev or 0) }, "~")
+					end
+
+					if o == "VREPL" then
+						-- ReplaceVehicle: the first field is the VEHICLE, so it maps
+						-- to a cross-peer key exactly like VSELL / VDEPOT / VREV do.
+						-- Without a key the peer cannot name the vehicle either, so
+						-- the replace stays local and the worlds diverge -- say so
+						-- loudly rather than ship a guess.
+						--
+						-- OPEN ITEM (needs a two-instance run to settle, not a
+						-- guess): if the engine mints a NEW entity for a replaced
+						-- vehicle, the K.PEER rebinds the key from its command result
+						-- (execVReplace) but the ORIGINATOR -- whose replace applied
+						-- natively, outside our command -- has no result to rebind
+						-- from, and its key would still name the dead id. The log
+						-- lines to compare are 'EXEC VREPL ... result=' on the peer
+						-- and the next 'veh: local vehicle N has no cross-peer key'
+						-- here. Do not paper over it with a poll until the capture
+						-- shows the id actually changes.
+						local k = CM.vehKeyFor(depot)
+						if k then
+							log(string.format("VREPL: %s, %d part(s): %s", k, #parts, enc[1]:sub(1, 60)))
+							-- armed=1: the slice cancelled it and the
+							-- originator replays at the stamp too; 0: it ran natively.
+							CM.scheduleLocal("VREPL", { veh = k,
+							                         parts = table.concat(enc, ";"),
+							                         groups = table.concat(groups, "/"),
+							                         armed = CM.lastArmed or 0 })
+						else
+							log(string.format("VREPL: vehicle %d has no cross-peer key -- "
+								.. "the replace stays LOCAL (divergence)", depot))
+						end
+					else
+						-- The command's depot is the VEHICLE_DEPOT CHILD entity, not the
+						-- construction (measured: r9=281727, no CONSTRUCTION component).
+						-- Find the parent construction -- the one whose depots list
+						-- holds the child -- and ship ITS position and file.
+						local dx, dy, dfile, dparent
+						pcall(function()
+							local parent
+							for _, rec in pairs(CM.consByKey) do
+								local co = api.engine.getComponent(rec.id, api.type.ComponentType.CONSTRUCTION)
+								if co and co.depots then
+									for i = 1, #co.depots do
+										if co.depots[i] == depot then parent = rec.id; break end
+									end
+								end
+								if parent then break end
+							end
+							if not parent then
+								-- construction not in our table (e.g. from the save):
+								-- scan every construction once
+								local list = game.interface.getEntities({ radius = 999999 },
+									{ type = "CONSTRUCTION", includeData = false }) or {}
+								for _, id in pairs(list) do
+									local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+									if co and co.depots then
+										for i = 1, #co.depots do
+											if co.depots[i] == depot then parent = id; break end
+										end
+									end
+									if parent then break end
+								end
+							end
+							if parent then
+								dparent = parent
+								local co = api.engine.getComponent(parent, api.type.ComponentType.CONSTRUCTION)
+								if co and co.transf then dx, dy = co.transf[13], co.transf[14] end
+								if co and co.fileName then dfile = tostring(co.fileName) end
+							end
+						end)
+						if not (dx and dy) then
+							log(string.format("VBUY: depot %d has no position -- NOT replicated", depot))
+						else
+							log(string.format("VBUY: depot %d at %.1f,%.1f (%s), %d part(s): %s",
+								depot, dx, dy, tostring(dfile), #parts, enc[1]:sub(1, 60)))
+							local bargs = { x = dx, y = dy, file = dfile or "?",
+							                parts = table.concat(enc, ";"),
+							                groups = table.concat(groups, "/"),
+							                skipOrigin = 1 }
+							-- STRICT: the slice cancelled the buy, so no vehicle
+							-- will ever appear in the depot to wait for. Parking
+							-- it would stall 1.5 s and then ship anyway without a
+							-- purchaseTime. Ship at once and let THIS instance
+							-- replay at the stamp like every peer -- which is the
+							-- whole point: the entity is then created on the same
+							-- sim-step everywhere.
+							-- carry the slice's ARMED verdict ON the command, so the
+							-- replay guard reads per-command truth
+							bargs.armed = tonumber(CM.lastArmed or 0)
+							-- A CLONE: the cancelled buy's callback would have put the new vehicle
+							-- on the original's line. The slice names that line in the VBUYLINE
+							-- right behind; the buy carries its key so every instance assigns the
+							-- vehicle from the buy's own callback, on the same step.
+							local nx = CM.injectNext
+							local cl = nx and tonumber(nx:match("^%s*VBUYLINE%s+(%-?%d+)"))
+							if cl and cl >= 0 then
+								local lk = CM.lineKeyFor(cl)
+								if lk then
+									bargs.cline = lk
+									log(string.format("VBUY: a clone -- the new vehicle joins line %s", lk))
+								else
+									log(string.format("VBUY: a clone onto local line %d, which has no cross-peer key -- the vehicle stays in the depot", cl))
+								end
+							end
+							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
+								-- NO expectVehicle here. Under strict the originator
+								-- REPLAYS its own buy, and execVBuy binds the key from
+								-- the command's own res.resultEntity -- the exact
+								-- vehicle that purchase produced. Registering a second,
+								-- HINTLESS pending key here made two entries compete for
+								-- one buy: the hintless one grabbed whichever fresh
+								-- vehicle it found first, so with several buys and line
+								-- assignments in quick succession the keys bound to the
+								-- wrong vehicles and setLine landed on the peers but not
+								-- on the originator (measured 2026-09-03, right after
+								-- strict buys went in).
+								CM.scheduleLocal("VBUY", bargs)
+								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
+								-- COMPANY PAINT (2026-09-16): the buy's key is ours, so the paint
+								-- goes out right behind it, as the parked path has done since
+								-- 0.4.12 -- this strict path, the one every buy takes, never did.
+								pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
+							else
+								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
+								CM.parkedBuys[#CM.parkedBuys + 1] = {
+									args = bargs, depot = dparent or depot,
+									since = CM.gameTime() or 0 }
+							end
+						end
+					end
+				else
+					log("inject: bad " .. tostring(o) .. " line: " .. line:sub(1, 70))
+				end
+
+			elseif o == "VSELL" and #w >= 2 then
+				local n = tonumber(w[2]) or 0
+				local ids = {}
+				for i = 1, n do local id = tonumber(w[2 + i]); if id and not CM.injForeignEdit("VSELL", id) then ids[#ids + 1] = id end end
+				-- Same key-binding race as VLINE: a sell right after a batch buy
+				-- finds the keys unbound and shipped NOTHING ("none shippable").
+				-- Defer and retry. STRICT (ARMED 1): the sale was
+				-- cancelled, the vehicles still stand here, and the originator
+				-- replays at the stamp like everyone else. ARMED 0: the host sold
+				-- natively already; vehKeyOf survives until forgetVehicle, so the
+				-- key still resolves after the vehicle is gone locally.
+				CM.deferVehCap({ kind = "VSELL", ids = ids, armed = CM.lastArmed or 0, since = CM.gameTime() or 0 })
+
+			elseif (o == "VNAME" and #w >= 3) or (o == "VCOLOR" and #w >= 5) then
+				-- The slice ships a LOCAL entity id. Work out what kind of thing it
+				-- is here, while we can still ask the engine, and put the shared key
+				-- on the wire instead: a vehicle key, a line key, or a position for
+				-- a construction. Anything else (a town building, an industry) is
+				-- not ours to rename.
+				local id = tonumber(w[2])
+                -- The native Linux slice cancels these commands. Windows lets
+                -- them execute locally and omits this marker. Keep the existing
+                -- wire command: every peer already understands skipOrigin=0.
+                local skipOrigin = 1
+                if w[o == "VNAME" and 4 or 6] == "replayOrigin=1" then skipOrigin = 0 end
+				-- a VCOLOR that is our own replay coming back through the slice is
+				-- dropped, or it echoes between the instances forever (CM.takeColorEcho)
+				local echo = o == "VCOLOR" and id ~= nil and CM.takeColorEcho ~= nil
+					and CM.takeColorEcho(id, tonumber(w[3]) or -1, tonumber(w[4]) or -1, tonumber(w[5]) or -1)
+				local kind, key
+				if id and not echo then
+					key = CM.vehKeyOf[id] and CM.vehKeyFor(id) or nil
+					if key then kind = "veh" end
+					if not key then
+						key = CM.lineKeyOf[id] and CM.lineKeyFor(id) or nil
+						if key then kind = "line" end
+					end
+					if not key then
+						local co
+						pcall(function() co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION) end)
+						if co and co.transf then
+							local ck = CM.conKey(co.transf[13], co.transf[14])
+							if CM.consByKey[ck] then key, kind = ck, "con" end
+						end
+					end
+					-- a vehicle or line that came out of the save: primed, not registered.
+					-- Lines first (review, 2026-08-31: a stale primedVeh id shadowed a live
+					-- line; forgetVehicle now clears it, the order still costs nothing).
+					if not key and CM.primedLines[id] then
+						key = CM.lineKeyFor(id); if key then kind = "line" end
+					end
+					if not key and CM.primedVeh[id] then
+						key = CM.vehKeyFor(id); if key then kind = "veh" end
+					end
+				end
+				-- A rename of our own company's player entity (the game's company
+				-- window) is the company's name: it travels as CMNAME (companies.lua)
+				-- and every instance names its own entity for that company. The
+				-- instance that renamed it has the new name already; CMNAME then
+				-- finds nothing to change there. (cmApplyNames renames through
+				-- make.setName, which the slice does not ship, so nothing echoes.)
+				local myCompanyPid = nil
+				if o == "VNAME" and id and not key and CM.cmMode == "companies" and CM.cmMyCompany then
+					myCompanyPid = CM.cmCompanyPid and CM.cmCompanyPid[CM.cmMyCompany]
+					if not myCompanyPid then pcall(function() myCompanyPid = api.engine.util.getPlayer() end) end
+				end
+				if echo then
+					log(string.format("VCOLOR: entity %s is our own replay coming back -- not shipped", tostring(w[2])))
+				elseif o == "VNAME" and id and id == myCompanyPid then
+					log(string.format("VNAME: entity %s is company %d's player -> CMNAME %s", tostring(id), CM.cmMyCompany, tostring(w[3])))
+					CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })
+				elseif key and CM.injForeignEdit(o, id) then
+					-- foreign vehicle: the read-only window's rename/colour control is inert
+				elseif key then
+					if o == "VNAME" then
+						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
+						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = skipOrigin })
+					else
+						log(string.format("VCOLOR: %s %s = %s,%s,%s", kind, key, w[3], w[4], w[5]))
+						-- rgb is the colour EXACTLY: encodeCmd rounds number fields to %.4f, and
+						-- the line editor matches line colours by exact float equality when it
+						-- picks a new line's colour (see LCREATEX below). r/g/b stay: the
+						-- company vehicle paint (companies.lua) sends only those.
+						CM.scheduleLocal("VCOLOR", { kind = kind, key = key,
+							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]),
+							rgb = string.format("%.9g,%.9g,%.9g", tonumber(w[3]) or 0, tonumber(w[4]) or 0, tonumber(w[5]) or 0),
+							skipOrigin = skipOrigin })
+					end
+				else
+					log(string.format("%s: entity %s is not a tracked vehicle, line or construction -- not shipped",
+						o, tostring(w[2])))
+				end
+
+			elseif o == "VREV" and #w >= 2 then
+				local id = tonumber(w[2])
+				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VREV", id) then k = nil end
+				if k then
+					log("VREV: " .. k)
+					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
+				end
+
+			elseif o == "TOWNC" and #w >= 9 then
+				-- Sandbox mode's town tool (mp/sandbox.lua). ARMED 1: the slice cancelled
+				-- the placement and every game, this one included, builds the town at the
+				-- stamp. The fields go on as the slice wrote them: pos stays text (float-
+				-- exact), and "name" is the key the codec never turns into a number.
+				local armed = CM.lastArmed or 0
+				log(string.format("TOWNC: town at %s capacities %s/%s/%s%s", tostring(w[2]), tostring(w[3]),
+					tostring(w[4]), tostring(w[5]), armed == 1 and " (strict)" or ""))
+				CM.scheduleLocal("TOWNC", { pos = w[2], c1 = tonumber(w[3]) or -1, c2 = tonumber(w[4]) or -1,
+					c3 = tonumber(w[5]) or -1, n1 = w[6], n2 = w[7], n3 = w[8], name = w[9], armed = armed })
+
+			elseif o == "VDEPOT" and #w >= 3 then
+				local id, sell = tonumber(w[2]), tonumber(w[3]) or 0
+				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VDEPOT", id) then k = nil end
+				if k then
+					local armed = CM.lastArmed or 0
+					log(string.format("VDEPOT: %s sell=%d%s", k, sell, armed == 1 and " (strict)" or ""))
+					-- armed=1: the slice cancelled it and the originator
+					-- replays at the stamp too; 0: it ran natively, peers only.
+					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
+				end
+
+			elseif o == "VSTOP" and #w >= 3 then
+				-- The vehicle window's stop/go toggle (SetUserStopped). Strict like
+				-- VDEPOT: the slice cancels the click and every instance, the
+				-- originator included, applies it at the stamp. Left local, the
+				-- train stopped here and kept running on the peers (2026-09-19).
+				local id, stopped = tonumber(w[2]), tonumber(w[3]) or 0
+				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VSTOP", id) then k = nil end
+				if k then
+					local armed = CM.lastArmed or 0
+					log(string.format("VSTOP: %s stopped=%d%s", k, stopped, armed == 1 and " (strict)" or ""))
+					CM.scheduleLocal("VSTOP", { key = k, stopped = stopped, armed = armed })
+				end
+
+			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then
+				-- foreign vehicle: the read-only window's line control is inert
+			elseif o == "VLINE" and #w >= 4 then
+				local id, line, stop = tonumber(w[2]), tonumber(w[3]), tonumber(w[4]) or 0
+				-- A batch buy binds its vehicle keys over the next few ticks
+				-- (pollVehKeys), so a SetLine captured immediately after the buy
+				-- often finds vehKeyFor == nil. Dropping it silently un-assigned
+				-- every such vehicle: the slice had already CANCELLED the host's
+				-- SetLine (STRICT, no-callback), so the vehicle was left off the
+				-- line on EVERY instance, the host included -- "only every other
+				-- vehicle got assigned" (2026-09-02). Retry the capture instead:
+				-- hold the raw id and re-resolve for a few seconds, then ship.
+				CM.deferVehCap({ kind = "VLINE", id = id, line = line, stop = stop,
+				                 armed = CM.lastArmed or 0, since = CM.gameTime() or 0 })
+
+			elseif o == "LCREATEX" and #w >= 7 then
+				-- A DECODED line creation (slice_hook.cpp, STRICT LINE CREATION):
+				--   LCREATEX <r> <g> <b> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n name=<enc>
+				-- ARMED 1: the UI's create was cancelled, so every instance -- this one
+				-- included -- creates the line at the stamp and the entity lands on the
+				-- same step with the same id everywhere. ARMED 0: it ran natively here;
+				-- read it back once it exists, as the event-only LCREATE always did.
+				local armed = CM.lastArmed or 0
+				local r, g, b = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
+				local wait, nstops = CM.waitNum(w[5], 180), tonumber(w[6]) or 0
+				local nameTok = line:match(" name=(%S+)%s*$")
+				local stops, alts, bad = {}, {}, nil
+				local pos = 7
+				for i = 1, nstops do
+					local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
+					local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
+					local na = tonumber(w[pos + 6]) or 0
+					pos = pos + 7
+					local al = {}
+					for _ = 1, na do
+						al[#al + 1] = string.format("%d:%d", tonumber(w[pos]) or 0, tonumber(w[pos + 1]) or 0)
+						pos = pos + 2
+					end
+					local x, y
+					if sg then x, y = CM.stationGroupPos(sg) end
+					if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
+					local sx, sy = CM.stationPosInGroup(sg, st)
+					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
+						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
+					alts[#alts + 1] = table.concat(al, "/")
+				end
+				if not bad and CM.lineCaptureCargo then CM.lineCaptureCargo(line, stops) end
+				if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
+				if armed ~= 1 then
+					CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
+				elseif bad or not (r and g and b) or not nameTok then
+					log(string.format("LCREATE: decoded create REJECTED (%s) -- it was cancelled and is LOST; create the line again",
+						bad or "name or colour unreadable"))
+				elseif tonumber(line:match(" spare=(%d+)")) and CM.spareKey and CM.lineKeyOf[tonumber(line:match(" spare=(%d+)"))] == CM.spareKey() then
+					-- THE SPARE (lines.lua): the slice already opened the editor on our
+					-- pre-made line. Ours here and now -- ownership is not simulated --
+					-- and everyone's, renamed and re-keyed, at the stamp.
+					local spareId = tonumber(line:match(" spare=(%d+)"))
+					local spareKey = CM.spareKey()
+					local okO, errO = pcall(CM.cmSetPlayer, spareId, api.engine.util.getPlayer())
+					local seqBefore = CM.seqNo
+					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
+					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
+					                           armed = 1, spare = spareKey })
+					if CM.seqNo ~= seqBefore then
+						CM.lineRekey(spareId, K.INSTANCE .. ":" .. tostring(CM.seqNo))
+						CM.spareWrite(nil)
+						-- its colour now, here (cosmetic; the claim sets it everywhere at the
+						-- stamp; the slice echo of this replay is expected, not a click)
+						pcall(function()
+							if CM.expectColorEcho then CM.expectColorEcho(spareId, r, g, b) end
+							api.cmd.sendCommand(api.cmd.make.setColor(spareId, api.type.Vec3f.new(r, g, b)), function() end)
+						end)
+						-- the GUI thread renames it and, through that, lets the slice open
+						-- the editor on it once the line manager lists it
+						if CM.spareFireWrite then CM.spareFireWrite(spareId, nameTok) end
+						log(string.format("LCREATE: '%s' is spare line %d (%s), the editor has it already -- ours now (ok=%s%s), everyone's at the stamp as %s:%d",
+							CM.unescName(nameTok), spareId, spareKey, tostring(okO), okO and "" or " " .. tostring(errO), K.INSTANCE, CM.seqNo))
+					else
+						log(string.format("LCREATE: spare line %d could not be scheduled (a hold) -- it stays the pool's", spareId))
+					end
+				else
+					local spareId = tonumber(line:match(" spare=(%d+)"))
+					if spareId then
+						log(string.format("LCREATE: the slice opened the editor on line %d as a spare, but it is not ours here (%s) -- a fresh line is created at the stamp and the editor shows the wrong one",
+							spareId, tostring(CM.lineKeyOf[spareId])))
+					end
+					log(string.format("LCREATE: '%s' decoded, %d stop(s) (strict: created at the stamp here too)",
+						CM.unescName(nameTok), #stops))
+					-- the colour stays EXACT (%.9g): the line editor colours the NEXT new line by
+					-- matching the existing lines' colours exactly against its palette, so a
+					-- line created at 0.4980 instead of 127/255 left orange "unused" and every
+					-- new line came out orange (slice_hook.cpp, LCREATEX)
+					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
+					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
+					                           armed = 1 })
+				end
+
+			elseif o == "LCREATE" then
+				CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
+
+			elseif o == "LUPDATE" and #w >= 2 then
+				local lid = tonumber(w[2])
+				-- The UI fires UpdateLine right after CreateLine; this line is
+				-- parsed BEFORE the tick's pollLineKeys would key the new line.
+				-- Key it now so the first stops are not dropped.
+				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
+				local lk = lid and CM.lineKeyFor(lid)
+				if lk and CM.injForeignEdit("LUPDATE", lid) then lk = nil end
+				if lk then
+					-- Two shapes. DECODED: the NEW stop list
+					-- came off the command itself -- the cancel means the entity
+					-- still holds the OLD one -- so build the stops string from it
+					-- exactly as lineSnapshot would, station groups resolved to
+					-- positions here while they still mean something. Name and
+					-- colour are not part of an UpdateLine; read them from the entity.
+					-- EVENT-ONLY (2 words, the decode failed): the update ran natively; read the
+					-- whole line back as before and ship it to the peers only.
+					local nstops = tonumber(w[4])
+					if #w >= 4 and nstops and #w >= 4 + nstops * 7 then
+						local wait = CM.waitNum(w[3], 180)
+						local stops, alts, bad = {}, {}, nil
+						local pos = 5   -- sequential: each stop carries a variable alternatives tail
+						for i = 1, nstops do
+							local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
+							local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
+							local na = tonumber(w[pos + 6]) or 0
+							pos = pos + 7
+							local al = {}
+							for a = 1, na do
+								al[#al + 1] = string.format("%d:%d", tonumber(w[pos]) or 0, tonumber(w[pos + 1]) or 0)
+								pos = pos + 2
+							end
+							-- NOT `sg and stationGroupPos(sg)`: `and` truncates a call to its
+							-- first return, so y was always nil and every decoded LUPDATE
+							-- died in string.format -- "cannot assign the new station to a
+							-- line" (2026-09-08).
+							local x, y
+							if sg then x, y = CM.stationGroupPos(sg) end
+							if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
+							local sx, sy = CM.stationPosInGroup(sg, st)
+							stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
+								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
+							alts[#alts + 1] = table.concat(al, "/")
+						end
+						if not bad and CM.lineCaptureCargo then CM.lineCaptureCargo(line, stops) end
+						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
+						-- asg=<0|1>: this click ran the editor's platform assignment (a station or
+						-- waypoint added); every instance re-runs it on the replayed list at the
+						-- stamp (slice: LINE PLATFORM ASSIGNMENT AT REPLAY). Absent for a manual
+						-- terminal pick, a stop setting or a removal, which replay verbatim.
+						local asg = tonumber(line:match(" asg=(%d)"))
+						local armed = CM.lastArmed or 0
+						if bad then
+							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
+							-- where a wrong guess shows. The cancel already happened
+							-- (armed=1), so say so plainly: the edit is lost, redo it.
+							log(string.format("LUPDATE: decoded line %s REJECTED (%s) -- %s", lk, bad,
+								armed == 1 and "the edit was cancelled and is LOST; redo it, and report this line" or "not replicated"))
+						else
+							local snap = CM.lineSnapshot(lid) or {}
+							local newStops, newAlts = table.concat(stops, ";"), table.concat(alts, ";")
+							-- a second quick edit: the editor built it from the list before the
+							-- first one landed -- put this click's change onto that one instead
+							-- The click was built from the list the EDITOR saw, which can be older than
+							-- both the entity (an update applied between the click and this read) and
+							-- the update still waiting: its own base is the recent list closest to it
+							-- (CM.lineBaseFor), and its change goes onto the newest list -- the update
+							-- still waiting, else the line as it stands now.
+							local pend = CM.linePending and CM.linePending(lk)
+							local target = pend or (snap.stops and snap) or nil
+							local base = (CM.lineBaseFor and CM.lineBaseFor(lk, newStops, snap)) or snap
+							if target and base and base.stops and target.stops ~= base.stops then
+								local okM, mS, mA, adds, dels, sets = pcall(CM.mergeLineEdit, base.stops, base.alts, newStops, newAlts, target.stops, target.alts)
+								if okM and mS then
+									log(string.format("LUPDATE: %s edited again before %s landed -- the click's change (+%d -%d ~%d) goes onto it: %d stop(s)",
+										lk, (pend and pend.seq) and ("seq " .. tostring(pend.seq)) or (pend and "the last edit" or "the list it was built from"),
+										adds, dels, sets, CM.lineCount(mS)))
+									newStops, newAlts = mS, mA
+									-- the merged list lands after the one it was put onto: it must not undo
+									-- that one's platform assignment with the click's stale platforms
+									if not asg and pend and pend.asg then asg = tonumber(pend.asg) end
+								else
+									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
+								end
+							end
+							-- a line no vehicle runs: applied here now, everyone else at the stamp
+							-- (lines.lua CM.lineApplyNow); armed 0 = "ran natively here" to execLine
+							local free = armed == 1 and (K.LINE_EDIT_FREE or 1) == 1 and CM.lineHasVehicles and not CM.lineHasVehicles(lid)
+							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %g%s", lk, #stops, wait,
+								free and " (no vehicles: applied here now, the others at the stamp)" or (armed == 1 and " (strict)" or "")))
+							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
+							                           wait = wait, stops = newStops,
+							                           alts = newAlts, armed = free and 0 or armed, asg = asg })
+							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts, asg) end
+							if free then
+								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts, asg = asg })
+								if not okA then log("LUPDATE: applying here now failed (" .. tostring(errA) .. ") -- it lands at the stamp with the others") end
+							end
+						end
+					else
+						-- The update ran natively here and the engine applies it on a later
+						-- step: read back NOW and the peers get the line as it was BEFORE the
+						-- edit (2026-09-16: two such read-backs were byte-identical to the
+						-- previous edit; the host's trains and the joiner's then routed
+						-- differently). Read it back a few steps from now instead.
+						CM.readbackSeq = (CM.readbackSeq or 0) + 1
+						CM.retryQueue = CM.retryQueue or {}
+						CM.retryQueue[#CM.retryQueue + 1] = { op = "LREADBACK", at = CM.gameTime() or 0, origin = K.INSTANCE,
+						                                     seq = 1000000 + CM.readbackSeq, key = lk, lid = lid,
+						                                     notBeforeStep = CM.stepOf(CM.gameTime() or 0) + 3 }
+						log(string.format("LUPDATE: %s ran natively (not decoded) -- reading it back in 3 steps", lk))
+					end
+				end
+
+			elseif o == "LDELETE" and #w >= 2 then
+				local lid = tonumber(w[2])
+				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
+				local lk = lid and CM.lineKeyFor(lid)
+				if lk then
+					local armed = CM.lastArmed or 0
+					log(string.format("LDELETE: %s%s", lk, armed == 1 and " (strict)" or ""))
+					CM.scheduleLocal("LDELETE", { key = lk, armed = armed })
+					-- Under strict the line still exists here and our own replay
+					-- must resolve its key; the replay callback forgets it on success.
+					if armed ~= 1 then CM.forgetLine(lid) end
+				end
+
+			elseif o == "ROADN" and #w >= 9 then
+				local n     = tonumber(w[2]) or 0
+				local etype = tonumber(w[3]) or 0
+				local stype = tonumber(w[4]) or 16
+				local ttype = tonumber(w[5]) or 1
+				-- The hook writes x,y pairs; z is sampled HERE, where groundAt is
+				-- in scope, and travels with the command so both peers use the
+				-- same heights.
+				local coords = {}
+				for i = 1, n do
+					local x, y = tonumber(w[4 + i * 2]), tonumber(w[5 + i * 2])
+					if not (x and y) then coords = nil; break end
+					coords[#coords + 1] = string.format("%.4f", x)
+					coords[#coords + 1] = string.format("%.4f", y)
+					coords[#coords + 1] = string.format("%.4f", CM.groundAt(x, y))
+				end
+				if coords and #coords == n * 3 and n >= 2 then
+					CM.scheduleLocal("ROADN", { pts = table.concat(coords, ","),
+					                         etype = etype, stype = stype, ttype = ttype })
+				else
+					log("inject: bad ROADN line: " .. line:sub(1, 60))
+				end
+
+			-- ROAD/RAIL x0 y0 x1 y1
+			elseif (o == "ROAD" or o == "RAIL") and #w >= 5 then
+				local x0, y0 = tonumber(w[2]), tonumber(w[3])
+				local x1, y1 = tonumber(w[4]), tonumber(w[5])
+				if x0 and y0 and x1 and y1 then
+					local a = { x0 = x0, y0 = y0, z0 = CM.groundAt(x0, y0),
+					            x1 = x1, y1 = y1, z1 = CM.groundAt(x1, y1), stype = 16 }
+					if o == "RAIL" then
+						a.ttype = tonumber(w[6]) or 1
+						a.cat   = tonumber(w[7]) or 0
+					end
+					CM.scheduleLocal(o, a)
+				end
+
+			-- CON <file> x y
+			elseif o == "CON" and #w >= 4 then
+				local x, y = tonumber(w[3]), tonumber(w[4])
+				if x and y then
+					CM.scheduleLocal("CON", { file = w[2], x = x, y = y, z = CM.groundAt(x, y) })
+				end
+
+			-- EDEMO <re> <rn> [<node0> <node1> <kind>]*re [<id> <x> <y> <z>]*rn
+			-- The slice ships node IDS because they are only ever resolved HERE,
+			-- on the instance that did the bulldozing. Endpoint nodes survive an
+			-- edge-only demolish, so they are still readable on this tick even
+			-- though the bulldoze has already applied; nodes the bulldozer also
+			-- removed are gone, and travel with their positions instead.
+			elseif o == "EDEMO" and #w >= 3 then
+				local re, rn = tonumber(w[2]), tonumber(w[3])
+				if re and rn and #w >= 3 + re * 3 + rn * 4 then
+					local gone = {}
+					local base = 3 + re * 3
+					for i = 0, rn - 1 do
+						local id = tonumber(w[base + i * 4 + 1])
+						local x  = tonumber(w[base + i * 4 + 2])
+						local y  = tonumber(w[base + i * 4 + 3])
+						local z  = tonumber(w[base + i * 4 + 4])
+						if id and x and y then gone[id] = { x, y, z or 0 } end
+					end
+					-- A node the bulldozer removed is checked against `gone`
+					-- FIRST and never reaches the engine. The entityExists guard
+					-- covers the rest: calling a component getter on a dead id
+					-- writes an ~800 KB minidump per call, and pcall does NOT
+					-- stop it (nil-entity-api-call-writes-a-minidump).
+					local function posOf(nid)
+						if gone[nid] then return gone[nid] end
+						local alive = false
+						pcall(function() alive = api.engine.entityExists(nid) end)
+						if not alive then return nil end
+						local ok, pos = pcall(CM.nodePosXYZ, nid)
+						if ok then return pos end
+						return nil
+					end
+					local recs, lost = {}, 0
+					for i = 0, re - 1 do
+						local n0   = tonumber(w[3 + i * 3 + 1])
+						local n1   = tonumber(w[3 + i * 3 + 2])
+						local kind = tonumber(w[3 + i * 3 + 3]) or 0
+						local p0 = n0 and posOf(n0)
+						local p1 = n1 and posOf(n1)
+						if p0 and p1 then
+							recs[#recs + 1] = string.format("%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
+								p0[1], p0[2], p0[3], p1[1], p1[2], p1[3], (kind == 1) and 1 or 0)
+						else
+							-- Never silent: an endpoint we cannot place is a road
+							-- the peers will keep, which is a divergence.
+							lost = lost + 1
+							log(string.format("EDEMO capture: edge %d dropped, endpoint unresolved (n0=%s p0=%s n1=%s p1=%s)",
+								i, tostring(n0), tostring(p0 and "ok"), tostring(n1), tostring(p1 and "ok")))
+						end
+					end
+					if #recs > 0 then
+						CM.scheduleLocal("EDEMO", { params = table.concat(recs, ";") })
+						log(string.format("EDEMO captured: %d edge(s) shipped, %d dropped", #recs, lost))
+					else
+						log(string.format("EDEMO captured: nothing shipped (%d dropped)", lost))
+					end
+				end
+
+			-- CDEMO <n> <id>... -- a construction demolish the slice CANCELLED.
+			-- The ids are local; resolve each to its file
+			-- and position NOW, while the construction is still standing (that
+			-- is what the cancel bought us), and ship that. strict=1 makes
+			-- execDemolish run here too and match exactly, not nearest-in-30m.
+			-- An id that is not a construction means the toRemove offset lied:
+			-- nothing is shipped for it and the construction stays put on every
+			-- instance (the bulldoze was cancelled), so nothing diverges.
+			elseif o == "CDEMO" and #w >= 3 then
+				local cnt = tonumber(w[2]) or 0
+				for i = 1, cnt do
+					local id = tonumber(w[2 + i])
+					local co
+					if id and id > 0 then
+						pcall(function()
+							if api.engine.entityExists(id) then
+								co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+							end
+						end)
+					end
+					if co and CM.cmMayModify and not CM.cmMayModify(id) then
+						log("CDEMO: refused demolition of foreign construction")
+					elseif co and co.transf then
+						local x, y = co.transf[13], co.transf[14]
+						local file = tostring(co.fileName or "")
+						CM.scheduleLocal("DEMOLISH", { x = x, y = y, z = CM.groundAt(x, y), file = file, strict = 1 })
+						log(string.format("CDEMO: id %d -> DEMOLISH %.1f,%.1f %s (strict, replays here at the stamp)",
+							id, x, y, file))
+					else
+						log(string.format("CDEMO: id %s is not a standing construction -- NOT shipped; the "
+							.. "bulldoze was cancelled, so it still stands on every instance (the slice read a wrong id: please report it)",
+							tostring(id)))
+					end
+				end
+
+			-- DEMOLISH x y
+			elseif o == "STOPXDEL" and #w >= 3 then
+			-- A CANCELLED stop / signal bulldoze: the
+			-- slice named the removed edge object off the bulldozer's proposal
+			-- and cancelled the native removal, ARMED 1 ahead of this line. The
+			-- object still stands here, so its position is read off it, and the
+			-- STOPDEL goes out WITHOUT skipOrigin: every instance, this one
+			-- included, removes it through nativeStopProposal at the stamp. The
+			-- poll path removed it here at click time and on the peers two steps
+			-- later; passengers walking to it re-planned on different steps and
+			-- the people count diverged from there (2026-09-08).
+			local eo, eid = tonumber(w[2]), tonumber(w[3])
+			if (CM.lastArmed or 0) ~= 1 then
+				log("STOPXDEL: not armed -- the native bulldoze ran, a catch-up scan ships it")
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
+			elseif eo and eo > 0 and CM.cmForeignOwner and CM.cmForeignOwner(eo) then
+				-- COMPANIES: another company's stop. The native bulldoze was cancelled,
+				-- so refusing here leaves it standing on every instance.
+				local _, fcid = CM.cmForeignOwner(eo)
+				log(string.format("STOPXDEL: edge object %d belongs to company %s -- REFUSED, a company cannot bulldoze another company's stop", eo, tostring(fcid or "?")))
+				pcall(CM.cmNote, string.format("That stop belongs to company %s -- you cannot bulldoze it", tostring(fcid or "?")))
+			elseif eo and eo > 0 then
+				local x, y
+				pcall(function()
+					local mil = api.engine.getComponent(eo, api.type.ComponentType.MODEL_INSTANCE_LIST)
+					local fi = mil and mil.fatInstances and mil.fatInstances[1]
+					if fi then x, y = fi.transf[13], fi.transf[14] end
+				end)
+				if x and y then
+					CM.scheduleLocal("STOPDEL", { x = x, y = y, cancelled = 1 })
+					log(string.format("STOPXDEL: cancelled bulldoze of edge object %d at %.1f,%.1f (edge %s) -> STOPDEL (strict, every instance replays)",
+						eo, x, y, tostring(eid)))
+				else
+					log(string.format("STOPXDEL: edge object %d has no model instance here -- DROPPED, the cancelled bulldoze is lost everywhere; bulldoze it again", eo))
+				end
+			else
+				log("inject: bad STOPXDEL line: " .. line:sub(1, 70))
+			end
+
+			elseif o == "DEMOLISH" and #w >= 3 then
+				local x, y = tonumber(w[2]), tonumber(w[3])
+				if x and y then
+					CM.scheduleLocal("DEMOLISH", { x = x, y = y, z = CM.groundAt(x, y) })
+				end
+
+			else
+				log("inject: unparsed line: " .. line:sub(1, 60))
+			end
+			end)
+			-- A geometry scope must never outlive the line that opened it: its map
+			-- lists would answer lookups on later ticks, after builds changed the world.
+			if (CM.geomDepth or 0) > 0 then
+				log(string.format("inject: closing %d geometry scope(s) left open by: %s", CM.geomDepth, line:sub(1, 40)))
+				while (CM.geomDepth or 0) > 0 do CM.geomScopeEnd() end
+			end
+			if not okLine then
+				log("inject dispatch error: " .. tostring(errLine) .. " -- " .. line:sub(1, 60))
+			end
+		end
+		if li >= heldFrom then CM.lastArmed = armedBefore end
+	end
+end
+end

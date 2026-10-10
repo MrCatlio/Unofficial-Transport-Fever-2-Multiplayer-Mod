@@ -1,0 +1,2122 @@
+-- MP Lockstep -- the game-script half of TpF2 Multiplayer (docs/ARCHITECTURE.md).
+--
+-- Replicates COMMANDS, not state. Every command carries the game time at which
+-- all peers must execute it; nobody executes early, including the originator.
+-- Correctness rests on the simulation being deterministic, which was measured:
+-- two instances, same save, 79 vehicles, 59/59 state hashes identical across 58
+-- in-game days (docs/re/GAME_LOOP_AND_UI.md).
+--
+-- WHY GAME TIME IS THE CLOCK
+-- Wall clock is useless -- the two processes are never in step, and one may be
+-- paused. A per-instance tick counter is no better: it starts at load and
+-- counts frames, so the same tick number means different world states. Game
+-- time is part of the simulation, both instances load it from the same save,
+-- and the determinism run showed it advances identically. So "execute at game
+-- time T" names the SAME sim state on every peer, which is precisely what
+-- lockstep needs.
+--
+-- Player commands reach this script through the slice DLL's inject file
+-- (captured, and cancelled natively while a session is live); what travels,
+-- and how each action is replayed, is in docs/REPLICATION.md.
+--
+-- LAYOUT (since 2026-09-08). This file is the entry point: constants (K), the
+-- shared state table (CM), the command dispatcher, the desync check and data().
+-- Everything else lives in res/scripts/mp/*.lua, each a factory
+--     require("mp.<name>")(CM, K, log)
+-- constructed in the order the sections used to sit in this file:
+--   hash       exact hashing, game time, world hash, vehicle drift metric
+--   io         runtime files (append/read), instance detection, wire broadcast
+--   companies  multi-company mode
+--   roads      road/track replay: command order, execEdge, execPolyline
+--   geom       hermite, node/edge lookup, mid-span splitting
+--   cons       constructions: hybrid replication, station edits, edge demolish, capture polls
+--   vehicles   vehicle identity, names/colours, vehicle commands, buy, replace
+--   lines      line identity, create/update/delete
+--   conx       native construction replay (CONP/CONX), CONFAIL, LOAN
+--   net        command reliability (NACK+resend), encode/decode, scheduleLocal, onLine
+--   stops      roadside stops and native-shape stop replay
+--   inject     the inject reader (pollInject)
+--   pacing     session speed, PID pacing, catch-up, load gate
+-- Every symbol used across module boundaries is a field of CM (CM.ticks,
+-- CM.queue, CM.execLine, ...); a file-scope local is by construction private
+-- to its module. Load-time order matters only for chunk-level statements
+-- (pacing's exec_delay read calls CM.cfgFlag from stops, for instance); calls
+-- between modules happen at runtime, after every factory has run.
+
+-- ---------- runtime data directory ----------
+-- Every runtime file (identity, events, captures, injects, status, logs) lives
+-- in ONE directory shared with the bridge and slice DLLs; native/src/datadir.h
+-- is the C++ half of this contract. Two candidates:
+--   1. $TPF2MP_DATADIR             (a harness pin)
+--   2. $LOCALAPPDATA/tpf2mp/data/  (shipping layout: Program Files is read-only
+--                                   for the game process, LOCALAPPDATA is not)
+-- The FIRST candidate holding tpf2_instance.txt wins: the bridge writes that
+-- file at game start, so its presence proves the DLLs settled on that dir. If
+-- none has it yet, 2 is used; with no readable LOCALAPPDATA either, loading
+-- stops with a readable error rather than guessing a folder.
+-- The game's Lua may lack 'os' entirely, hence the pcall around every getenv.
+-- No new top-level locals (the chunk sits at Lua 5.1's 200-local limit): the
+-- discovery is an immediately-invoked function and its bookkeeping lives in CM
+-- (CM.baseSource = which candidate won, CM.baseCandidates = every candidate
+-- dir, for readers that must look where a peer may have landed).
+-- Constants and the per-instance file paths live here rather than as two
+-- dozen more top-level locals: Lua allows 200 per chunk, and this file has
+-- already hit that ceiling once, where the mod silently fails to load.
+local K = {}
+
+local CM = {}   -- the one catch-all state table; documented at its former home below
+-- Boot markers (2026-09-10): a friend's game died loading this file with
+-- "Lua exception" and an EMPTY message. Each step now prints before it runs,
+-- so stdout shows how far loading got, and a failure says what broke. Bytes
+-- above 127 are printed as "?": a Windows path with an accented user name is
+-- not valid UTF-8, and a message holding one came out as nothing at all.
+print("[ls-boot] lockstep.lua: finding the data folder")
+CM.bootOk, K.BASE = pcall(function()
+	local function env(name)
+		local ok, v = pcall(function() return os.getenv(name) end)
+		if ok and type(v) == "string" and #v > 0 then return v end
+		return nil
+	end
+	local function dir(p)
+		p = p:gsub("\\", "/")
+		if p:sub(-1) ~= "/" then p = p .. "/" end
+		return p
+	end
+	local cands = {}
+	local function add(source, p)
+		if p then cands[#cands + 1] = { source = source, path = dir(p) } end
+	end
+	add("TPF2MP_DATADIR", env("TPF2MP_DATADIR"))
+	local lad = env("LOCALAPPDATA")
+	add("LOCALAPPDATA", lad and (lad .. "/tpf2mp/data"))
+	CM.baseCandidates = {}
+	for _, c in ipairs(cands) do CM.baseCandidates[#CM.baseCandidates + 1] = c.path end
+	for _, c in ipairs(cands) do
+		-- Each probe in its own pcall. A player with 503 mods crashed the game here
+		-- with the error value "file (0000000000000000)": io.open or close THREW, and
+		-- threw a file handle rather than a message -- the game's script state is shared
+		-- with every mod's game scripts, so io may not be the standard library
+		-- (2026-09-12). A probe that throws just means "not proven here".
+		local okOpen, f = pcall(io.open, c.path .. "tpf2_instance.txt", "r")
+		local isFile = false
+		if okOpen and f then
+			pcall(function() isFile = (io.type == nil) or io.type(f) == "file" end)
+			pcall(function() f:close() end)
+		elseif not okOpen then
+			CM.bootIoError = f
+		end
+		if isFile then
+			CM.baseSource = c.source .. " (identity file found)"
+			return c.path
+		end
+	end
+	-- no identity anywhere yet: the shipping folder
+	local pick
+	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
+	if not pick then error("LOCALAPPDATA is not readable, and TPF2MP_DATADIR (if set) holds no tpf2_instance.txt", 0) end
+	-- The game's io.open wants UTF-8 and os.getenv hands back ANSI bytes, so a
+	-- profile folder with non-ASCII characters cannot be opened from here. The proxy
+	-- DLL publishes an ASCII TPF2MP_DATADIR for exactly that case (datadir.h); if we
+	-- got this far without it, the DLLs are not running, and nothing would work.
+	if pick.path:find("[\128-\255]") then
+		error("the Windows user folder has non-ASCII characters and the multiplayer DLLs did not publish TPF2MP_DATADIR (reinstall with the installer, and start the game through Steam)", 0)
+	end
+	CM.baseSource = pick.source .. " (no identity file yet)"
+	return pick.path
+end)
+if not CM.bootOk then
+	-- NEVER stop the game's load. error() here aborted creating a new game outright
+	-- ("Exception during init", 2026-09-12) for a player with a plain single-player
+	-- setup. The mod switches itself off for this game instead: an empty game
+	-- script, and a line in stdout saying why.
+	local function txt(v) return type(v) .. " " .. (tostring(v):gsub("[\128-\255]", "?")) end
+	print("[ls-boot] Transport Fever 2 Multiplayer: finding the data folder failed: " .. txt(K.BASE)
+		.. " | io=" .. type(io) .. " io.open=" .. type(io and io.open) .. " last io error=" .. txt(CM.bootIoError)
+		.. " -- multiplayer is OFF for this game; everything else loads normally")
+	function data() return {} end
+	return
+end
+print("[ls-boot] data folder " .. (K.BASE:gsub("[\128-\255]", "?")) .. " (" .. tostring(CM.baseSource) .. ")")
+K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
+
+K.INSTANCE  = nil
+K.PEER      = nil
+-- (was: local K.CAPTURE_FILE, K.EVENTS_FILE, K.INJECT_FILE) -- fields of K now, nil until set
+local guiTick = 0   -- gui-state only
+
+-- UNITS. getGameTime().time is NOT seconds: comparing a live reading (t=55234)
+-- against the M3 probe's day counter (day=27617) puts it at ~2 units per
+-- in-game DAY. The first draft used 30 here thinking it meant 30 seconds; it
+-- would have been 15 game days, roughly seven minutes of waiting per command,
+-- with desync checks 100 days apart. Everything below is in these units.
+--
+-- How far ahead commands are scheduled. Must exceed worst-case delivery
+-- latency, which here is a file relay measured in milliseconds -- so ~2 game
+-- days is enormous margin, and still under a minute of wall clock at speed 1.
+-- MEASURED: 1 game-time unit is ~1.1s of wall clock at speed 1 (300 ticks took
+-- 56s and advanced 50 units), so this delay IS the felt latency of a build.
+--
+-- What correctness needs is K.EXEC_DELAY > the peers' ACTUAL skew, and a
+-- stamp also pays the fastest peer's lead (net.lua scheduleLocal). The !! LATE
+-- warning measures the real skew -- if it starts firing, actual drift exceeds
+-- the margin and the delay must go up. That is a measurement, not a guess.
+-- MEASURED: the game clock is FRACTIONAL, advancing in steps of exactly 0.2
+-- units (~0.22s wall clock) -- so sub-second stamps are possible. A single
+-- sample at load read 55234.000000 and looked integer; it was just a round
+-- value from the save. Step size is what settles resolution, not one reading.
+K.EXEC_DELAY = 0.4   -- two sim steps; was 0.6 until 2026-09-11 (RECV logs spare= to keep checking it)
+
+-- AUTO DELAY (2026-09-11). Unless tpf2_slice.cfg pins exec_delay, the delay
+-- follows the measured round trip to each peer (heartbeat echoes, CM.rttNote):
+-- half the worst peer's smoothed round trip plus K.DELAY_DEV_MULT deviations and
+-- a slack, converted to game units at the current sim rate, snapped up to the step
+-- grid. K.EXEC_DELAY above is only the starting value until a peer has been
+-- measured. It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS,
+-- and only with K.DELAY_DOWN_MARGIN to spare; a round trip timed across a freeze
+-- (an autosave, the world hash) is not a sample (net.lua, FREEZES ARE NOT LATENCY).
+--
+-- ONE deviation, not two (first rig run, 2026-09-11): on one PC the round trip is
+-- 200-300 ms of which almost all is each side waiting for its next script tick,
+-- and that wait is uniformly jittery (+-60..160 ms). Two deviations sat the delay
+-- at 0.6 with spikes to 1.0 while the fixed 0.4 before it never had a command
+-- arrive late (13 saved runs, 300 RECVs: late 0 bar one catch-up, spare 0.00 in
+-- ~5%). One deviation gives 0.4 there. Eight samples before trusting a peer: the
+-- first few echoes straddle the load and read 500+-340 ms.
+-- Floor 0.4, not 0.2: a command is only read on the receiver's next script tick
+-- (about one sim step) wherever the peer is, and at 0.4 ~5% already arrived with
+-- 0.00 to spare -- a calm 226+-28 ms sample would have picked 0.2 and run late.
+K.EXEC_DELAY_MIN = 0.4
+K.EXEC_DELAY_MAX = 3.0
+K.DELAY_SLACK_MS = 50
+K.DELAY_DEV_MULT = 1
+K.DELAY_DOWN_TICKS = 25
+K.RTT_MIN_SAMPLES = 8
+
+-- GAP HOLD (2026-09-11). A command a peer has announced (LSHI, or hi= on its
+-- heartbeat) but we have not received holds this game at speed 0 before its
+-- stamp comes due, until the resend fills it (CM.gapHoldTick, net.lua).
+K.GAP_HOLD_GRACE_TICKS = 1     -- ordinary reordering never stutters the game
+K.GAP_HOLD_ENGAGE_TICKS = 3    -- engage this many ticks of sim progress ahead of the stamp
+K.GAP_HOLD_MAX_TICKS = 55      -- ~10 s: then give up on that command (it applies late if it comes)
+K.HOLD_NACK_EVERY = 3          -- ticks between NACKs for the command a hold is waiting for (net.lua gapHoldTick)
+-- A LOST COMMAND IS NOT RECOVERED, IT IS NOT LOST (2026-09-16). Every command goes out
+-- CMD_SEND_COPIES times back to back and once more on each of the next CMD_REPEATS
+-- ticks (net.lua scheduleLocal / txRepeatTick); the delay pays DELAY_REPEAT_TICKS
+-- ticks for the repeat (execDelayTick). Recovery (NACK + resend) stays as the backstop.
+K.CMD_SEND_COPIES = 2
+K.CMD_REPEATS = 1
+K.DELAY_REPEAT_TICKS = 1
+
+-- The most peer lead a command's stamp will pay for: a live session was seen
+-- 9.2 units apart (net.lua scheduleLocal).
+CM.MAX_LEAD = 15.0
+
+-- Heartbeats cross between instances through a FILE RELAY (B is sandboxed), so
+-- they are not free. At every 2 ticks the relay fell behind and instance A was
+-- reading peer times ~13 units stale while B saw A correctly -- both then paused
+-- against bad data. 5 ticks is a rate the relay keeps up with.
+K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- the pacer's lead reading is only as fresh as this)
+
+-- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
+-- because scheduleLocal consults it too, long before the pacing section.
+K.PEER_STALE_TICKS = 25
+K.SOLO_RELEASE_TICKS = 75  -- ~15 s alone (lobby gone or roster 1) before a world-operation hold is abandoned (resync.lua)
+K.SOLO_RELEASE_SECONDS = 15 -- how stale tpf2_sync_available.txt may be before the lobby counts as gone (resync.lua)
+K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
+K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
+-- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
+-- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
+-- own bookkeeping -- which is what "it feels laggy" actually was.
+--
+-- The interval CANNOT be tuned from each instance's own measured cost: the hash
+-- stamp is floor(now / interval) * interval, so two instances with different
+-- intervals produce DISJOINT stamp sets and never compare a single one. (That
+-- exact failure is recorded at the checkHash call site: one SYNC verdict for a
+-- whole session while a real divergence sat invisible.) So it STARTS from the
+-- EDGE COUNT, which every instance reads from the same save, bucketed coarsely so
+-- a few edges of drift cannot change the answer. Since 2026-09-15 the leader then
+-- moves every instance to an interval that follows the measured cost, with a
+-- stamped HASHEVERY command (hash.lua, COST-PROPORTIONAL CADENCE).
+K.HASH_EDGES_PER_STEP = 2000   -- edges per extra interval step
+K.HASH_EVERY_MAX_MULT = 64     -- up to 12 * 64 = 768 units to START with, so a map far past vanilla begins rare rather than unchecked; the leader's cost ladder takes it from there
+function CM.hashEveryFor(edges)
+	local mult = math.floor((tonumber(edges) or 0) / K.HASH_EDGES_PER_STEP) + 1
+	if mult > K.HASH_EVERY_MAX_MULT then mult = K.HASH_EVERY_MAX_MULT end
+	return K.HASH_EVERY_GAMETIME * mult
+end
+
+CM.ticks        = 0
+CM.eventsOffset = -1
+CM.injectOffset = -1
+CM.seqNo        = 0
+-- EVERY PEER, keyed by its letter. The lockstep core was written for exactly
+-- two players (one peer, letters a/b); this table is what makes N work. The
+-- rules that used to read "the peer" now read over all of them: a command's
+-- stamp clears the FASTEST, joiners pace against the leader, and a stamp is
+-- SYNC only when every peer that reported agrees. A peer is "fresh" while its
+-- last tick is within K.PEER_STALE_TICKS.
+CM.peers = {}   -- origin -> { time=, at=, hashes={[stamp]=h}, details={[stamp]=d}, streak=n }
+-- THE LEADER: the one instance that is the session clock (constant speed, the
+-- LSEFF sender, the history/NACK server, the sync-save taker). It used to be
+-- letter "a" by definition; a relay lobby names it in the bridge ctl
+-- (leader=<letter>, the roster's host) so the role survives "a" leaving.
+CM.leader = "a"
+function CM.isLeader() return K.INSTANCE == (CM.leader or "a") end
+-- peers heard within the stale window: 0 = we are playing alone right now
+function CM.livePeers()
+	local n = 0
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then n = n + 1 end
+	end
+	return n
+end
+function CM.peerFor(o)
+	local pr = CM.peers[o]
+	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end
+	return pr
+end
+-- Fastest peer by the PRECISE clock: the pause point everyone runs to. Falls
+-- back to the coarse reading for a peer that has not sent a step yet (an older
+-- build). A peer that is CATCHING UP (cu=1 on its heartbeat: a hot joiner
+-- running through the command history at high speed) is left out: it would
+-- drag everyone to its clock. It counts again the moment it drops the flag.
+function CM.peerFastPrecise()
+	local maxT
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			if t and (not maxT or t > maxT) then maxT = t end
+		end
+	end
+	return maxT
+end
+
+-- THE LEADER's precise clock (its last sim step): nil when we ARE the leader
+-- or have not heard it within the stale window. Joiners pace against this and
+-- nothing else (2026-09-10). The fastest peer used to be the catch-up
+-- reference, so joiners chased a joiner that had overshot, and the leader --
+-- with no leader of its own -- took that joiner for "the session" and held
+-- itself at speed 0 to catch up with it. pr.cu is ignored: the leader never
+-- catches up, and an older build's flag must not hide the session clock.
+function CM.leaderPrecise()
+	if CM.isLeader() then return nil end
+	local pr = CM.peers[CM.leader or "a"]
+	if not (pr and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS) then return nil end
+	return pr.step and (pr.step * K.SIM_STEP) or pr.time
+end
+
+-- cu=1 on our heartbeat: catching up, or far behind the leader, so nobody
+-- paces against our clock. Never on the leader: it IS the clock.
+-- Also from the FIRST heartbeat after a load until the load gate has the
+-- command history since our save (CM.lgFetch, pacing.lua): the leader prunes
+-- its history only while nobody is catching up, and a game that has just
+-- loaded is about to ask for it.
+function CM.heartbeatCu(now)
+	if CM.isLeader() then CM.farBehind = false; return false end
+	local ref = CM.leaderPrecise() or CM.peerFastPrecise()
+	CM.farBehind = (ref ~= nil) and (ref - now) > K.CATCHUP_MIN
+	return (CM.catchingUp2 or CM.farBehind or (CM.lgFetch ~= nil and CM.lgFetch ~= "done")) and true or false
+end
+
+function CM.peerBounds()
+	local minT, maxT
+	for _, pr in pairs(CM.peers) do
+		if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
+			if not minT or pr.time < minT then minT = pr.time end
+			if not maxT or pr.time > maxT then maxT = pr.time end
+		end
+	end
+	return minT, maxT
+end
+-- The status line's peer clock is also the slice's evidence that somebody will
+-- replay a build: SessionLive (slice_hook.cpp) cancels and replays a player's
+-- action only when peer= holds a positive time, and "?" means a solo game, so the
+-- engine builds natively. peerBounds leaves out peers that are catching up --
+-- right for pacing, wrong here. On 2026-09-10 a joiner still flagged cu=1 after
+-- its hot join made the leader's status read "peer=?" for a few seconds; a track
+-- the leader drew in that window ran natively on the leader, the joiner replayed
+-- it with different geometry (10 nodes apart) and the session desynced. Any fresh
+-- peer counts here, catching up or not; a stale one still does not.
+function CM.statusPeerT()
+	if CM.slowT then return CM.slowT end
+	local minT
+	for _, pr in pairs(CM.peers) do
+		if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			if not minT or pr.time < minT then minT = pr.time end
+		end
+	end
+	return minT
+end
+-- The line the MP panel and the slice read. A live peer shows at least 1: the
+-- slice treats peer=0 as solo, and a session's first second is at t=0.
+function CM.statusLine(now)
+	local pt = CM.statusPeerT()
+	-- mp= is the lobby's player count (tpf2_bridge_ctl.txt): a multiplayer session is
+	-- known from the first ticks, seconds before the peer's first heartbeat. The slice
+	-- reads it so a build in that window is cancelled and replayed like any other,
+	-- instead of running natively on one instance only (2026-09-11: two tracks laid
+	-- 2 s after loading existed on A and nowhere else).
+	-- stage= (2026-09-16): what a hot joiner is doing, for the lobby roster
+	-- (the menu DLL reads it and tells the host): starting until a peer is
+	-- heard, catchup:<fetch|run>:<behind> while the catch-up runs, behind:<n>
+	-- while more than 2 units back, live otherwise.
+	local stage = "live"
+	if not CM.peerSeen then stage = "starting"
+	elseif CM.catchingUp2 then stage = string.format("catchup:%s:%.1f", tostring(CM.cuPhase or "run"), CM.behindBy or 0)
+	elseif (CM.behindBy or 0) > 2 then stage = string.format("behind:%.1f", CM.behindBy or 0) end
+	-- cm= (2026-09-16): companies mode as the SIM knows it. The lobby's
+	-- mp_company_cfg.txt says what the roster was at START; a company created
+	-- in game never reaches that file, so the slice's shared-stations gate read
+	-- "coop" on both machines and opened nothing (foreignAsked=2344 opened=0).
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s  cm=%s",
+		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
+		pt and string.format("%+.1f", now - pt) or "?",
+		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
+		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage, CM.cmMode == "companies" and "companies" or "coop")
+end
+-- Letter -> 0..7, for anything that needs a per-origin namespace.
+function CM.originIdx(o)
+	local b = string.byte(tostring(o or "a"), 1) or 97
+	return math.max(0, math.min(7, b - 97))
+end
+CM.peerSeen     = false
+CM.lateCount    = 0   -- commands whose game-time stamp had already passed here
+CM.queue        = {}         -- pending commands
+local executed     = {}         -- key -> true, so a command runs at most once
+local executedAge  = {}         -- insertion order, so `executed` stays bounded
+local executedSeq  = 0
+-- NOTHING keyed by stamp or by command may grow for the life of the session.
+-- All of these were unbounded: one entry per 4-unit stamp per peer across five
+-- tables, one per command in `executed`, and one per sequence number per origin
+-- in the rx bookkeeping -- and CM.nackScan then walked the WHOLE sequence range
+-- every 10 ticks, so the per-tick cost of the gap scan rose with everything the
+-- players had ever done. The vpos lanes were already pruned to K.VPOS_KEEP; the
+-- rest never got the same treatment.
+K.STAMP_KEEP    = 64      -- hash/detail/compare stamps kept per side (~4 min)
+K.EXECUTED_KEEP = 2048    -- applied commands remembered, for resend de-dup
+
+-- Drop all but the newest `keep` entries of a table whose keys sort in age
+-- order (a stamp, or a "<letter>:<stamp>" string).
+function CM.pruneOldest(tbl, keep)
+	if not tbl then return end
+	local ks, n = {}, 0
+	for k in pairs(tbl) do n = n + 1; ks[n] = k end
+	if n <= keep then return end
+	table.sort(ks)
+	for i = 1, n - keep do tbl[ks[i]] = nil end
+end
+local lastHashAt   = nil
+CM.myHashes     = {}         -- [stamp] = our own hash
+CM.myDetails    = {}         -- [stamp] = our own per-component breakdown
+CM.desyncs = 0
+-- when this game's script state started: the dash file carries it as boot=, so
+-- the GUI state's desync popup can tell this game's count from a leftover file
+CM.bootWall = os.time()
+
+-- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
+-- so notable events are harvested HERE, at the one point every message passes,
+-- and written out with the status. Nothing else needs to know a dashboard exists.
+CM.dashEvents = {}
+CM.dashVerdict = "-"
+local function dashNote(line)
+	local keep = line:find("success=false", 1, true) or line:find("DESYNC", 1, true)
+		or line:find("LATE", 1, true) or line:find("FAIL", 1, true) or line:find("DIVERGENCE", 1, true)
+		or line:find("captured", 1, true) or line:find("EXEC ", 1, true) or line:find("PACE:", 1, true)
+		or line:find("error", 1, true)
+	if not keep then return end
+	if line:find("SYNC t=", 1, true) and not line:find("DESYNC", 1, true) then return end
+	local stamp = os.date("%H:%M:%S")
+	local ev = CM.dashEvents
+	ev[#ev + 1] = stamp .. "  " .. line:sub(1, 110)
+	while #ev > 8 do table.remove(ev, 1) end
+end
+local function log(s)
+	print("[ls-" .. (K.INSTANCE or "?") .. "] " .. s)
+	pcall(dashNote, s)
+end
+
+-- PERF LANES (2026-09-23): the update's cost per job, so the PERF line says WHICH
+-- part of a big map's update is dear instead of one total. Each call closes the
+-- lane that began at t0 and returns the clock for the next one. Measurement only.
+function CM.perfLane(name, t0)
+	local t1 = os.clock()
+	local lanes = CM.perfLanes or {}
+	CM.perfLanes = lanes
+	local p = lanes[name]
+	if not p then p = { sum = 0, max = 0 }; lanes[name] = p end
+	local dt = (t1 - t0) * 1000
+	p.sum = p.sum + dt
+	if dt > p.max then p.max = dt end
+	return t1
+end
+-- the dearest lanes of the window, "name avg/max ms", for the PERF line
+function CM.perfLanesText(n)
+	local rows = {}
+	for name, p in pairs(CM.perfLanes or {}) do rows[#rows + 1] = { name = name, sum = p.sum, max = p.max } end
+	table.sort(rows, function(a, b) if a.sum ~= b.sum then return a.sum > b.sum end return a.name < b.name end)
+	local out = {}
+	for i = 1, math.min(#rows, 10) do
+		local r = rows[i]
+		out[#out + 1] = string.format("%s %.2f/%.0f", r.name, n > 0 and r.sum / n or 0, r.max)
+	end
+	return table.concat(out, ", ")
+end
+
+-- ---------- module loading that says what broke ----------
+-- Every module loads through CM.boot: a step marker first, then on a failure
+-- a readable message naming the module (accented bytes shown as "?", see the
+-- boot markers above). A require that hands back something other than our
+-- factory is named too: another mod replacing require would look like that.
+-- CM fields, not locals: this chunk sits near Lua 5.1's 200-local limit.
+function CM.bootText(v)
+	return (tostring(v):gsub("[\128-\255]", "?"))
+end
+-- A module that cannot load switches the mod OFF for this game; it never stops the
+-- game's own load (error() here aborted it with "Exception during init"). Later
+-- modules are skipped and the chunk-level code between them indexes a stub that
+-- answers every field with a no-op, so the check before data() can return an
+-- empty game script.
+function CM.bootStub()
+	return setmetatable({}, { __index = function() return function() end end })
+end
+function CM.bootFail(msg)
+	print("[ls-boot] " .. msg)
+	CM.bootFailed = CM.bootFailed or msg
+	return CM.bootStub()
+end
+function CM.boot(name)
+	if CM.bootFailed then return CM.bootStub() end
+	print("[ls-boot] loading " .. name)
+	local ok, factory = pcall(require, name)
+	if not ok then
+		return CM.bootFail("Transport Fever 2 Multiplayer: require('" .. name .. "') failed: " .. CM.bootText(factory))
+	end
+	if type(factory) ~= "function" then
+		return CM.bootFail("Transport Fever 2 Multiplayer: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)")
+	end
+	local ok2, result = pcall(factory, CM, K, log)
+	if not ok2 then
+		return CM.bootFail("Transport Fever 2 Multiplayer: module " .. name .. " failed while loading: " .. CM.bootText(result))
+	end
+	return result
+end
+
+-- ---------- exact hashing, game time, world hash (desync detector), vehicle drift metric ----------
+-- Lives in res/scripts/mp/hash.lua (see the header there).
+local hash = CM.boot("mp.hash")
+local worldHash, vposPrune
+CM.gameTime, worldHash, vposPrune = hash.gameTime, hash.worldHash, hash.vposPrune
+CM.recoveryWorldHash = worldHash
+-- ---------- runtime files: append/read, instance detection, wire broadcast ----------
+-- Lives in res/scripts/mp/io.lua.
+CM.boot("mp.io")
+-- ---------- multi-company mode (opt-in; co-op is the default and is untouched) ----------
+-- Lives in res/scripts/mp/companies.lua (see the header there).
+CM.boot("mp.companies")
+CM.boot("mp.companies_gui")   -- the COMPANIES tab (GUI state only draws it)
+
+-- Forward declarations: worldHash uses these, and they are defined further
+-- down. A later `local function` would create a DIFFERENT variable and this
+-- reference would resolve to a nil global at call time -- the groundAt bug.
+-- (forward declaration of ser, deepcopy, isPlayerConstruction moved into CM)
+-- (forward declaration of scheduleLocal moved into CM)
+-- JournalEntryCategory.type, MEASURED live (2026-09-01, EVAL probe: ten entries
+-- of 1000*2^t booked with type t): every type adds to the balance, and type 0
+-- ALSO adds to the loan. So 0 is the loan category and 6 (the constructor's
+-- default) is a plain balance movement. Cost transfers used 0 until today and
+-- were quietly changing both players' loans by the transferred amount.
+K.JOURNAL_LOAN = 0
+-- How long a replayed loan may take to land before we stop waiting for it.
+-- cmBookJournal chunks at 10,000,000 and each chunk is an async command, so
+-- a 30,000,000 loan is several ticks of settling.
+K.LOAN_SETTLE_TICKS = 90
+K.JOURNAL_TRANSFER = 6
+K.STRICT_OPS = { VREV = true, VSTOP = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true, TOWNC = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+-- CONX/CONP have no slice cancel (the construction's module params cannot be
+-- read from the proposal); the originator instead deletes its native copy and
+-- replays, gated by c.cancelled rather than ARMED. See execConX.
+-- Command reliability. LSCMD ships as fire-and-forget UDP; a fully-dropped
+-- command silently desyncs the peer that missed it (measured 2026-09-01: one
+-- instance never got a VBUY and ran a truck short). Each instance keeps a ring
+-- of its own recently-sent commands; a receiver that sees a gap in an origin's
+-- contiguous seq numbers NACKs it and the origin rebroadcasts. Duplicates are
+-- already harmless (executed[cmdKey] dedups at apply time).
+-- The simulation advances in fixed steps of 0.2 game units (GameSim::Step, 5 Hz
+-- at speed 1; measured 2026-08-07). A command stamp is therefore a STEP, not a
+-- time: stamps are snapped to the step grid, application is decided in steps,
+-- and lag is counted in whole steps. This is the unit the delivery buffer will
+-- be sized in.
+K.SIM_STEP = 0.2
+-- Batch buys: departures must land on the SAME sim-step everywhere. A buy's
+-- dependent line-assign is held until the batch's last buy plus this many
+-- steps (bind latency of the async buy callback + pollVehKeys), and a VLINE
+-- still waiting for its key advances in fixed steps, never by local wall/game
+-- time. Both derive only from the agreed stamp, so they are identical on every
+-- instance (a frame-tick count is not: ticks map to instance-specific game-time,
+-- which is what drifted departures -- review, 2026-09-01).
+K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
+K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VCOLOR_RETRY_MAX = 50      -- a company paint waits up to 50 of those for its vehicle's key (vehicles.lua execSetColor)
+K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
+K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
+-- Own commands are kept for resend until every live peer has acknowledged them
+-- (ak= on the heartbeat, net.lua CM.sentPrune) -- no count (K.CMD_RING, 256,
+-- until 2026-09-16), and the history answers what the ring no longer holds.
+K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
+K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
+-- How close a peer's node must be to a shipped demolish endpoint to be
+-- accepted as the same node, SQUARED. Nodes come from identically replayed
+-- proposals so they agree to well under a centimetre; a metre is generous
+-- enough to absorb float drift and still far too tight to select a
+-- neighbouring junction and bulldoze the wrong road.
+K.EDEMO_TOL_SQ = 1.0
+K.NACK_MAX = 10           -- give up on one seq after this many NACKs
+K.NACK_PER_SCAN = 12      -- cap NACKs sent per scan so a big gap does not flood
+K.RESEND_MIN_GAP = 5      -- ticks: do not rebroadcast the same seq more often
+
+-- ---------- road/track replay: command order, proposal context, execEdge, execPolyline ----------
+-- Lives in res/scripts/mp/roads.lua.
+CM.boot("mp.roads")
+-- ---------- edge geometry: hermite, node/edge lookup, mid-span splitting (ported from mp_bridge) ----------
+-- Lives in res/scripts/mp/geom.lua (see the header there).
+local geom = CM.boot("mp.geom")
+CM.hermitePos, CM.hermiteTangent, CM.edgeGeomT, CM.findNodeNear, CM.findEdgeContaining, CM.copyEdgeProps = geom.hermitePos, geom.hermiteTangent, geom.edgeGeomT, geom.findNodeNear, geom.findEdgeContaining, geom.copyEdgeProps
+
+-- Diagnostic export: EVAL chunks run in the global environment and cannot
+-- see this file's locals. Exposing the geometry helpers lets a probe try a
+-- weld or a split on the live world without a rebuild cycle.
+LS = { findNodeNear = CM.findNodeNear, findEdgeContaining = CM.findEdgeContaining,
+       edgeGeomT = CM.edgeGeomT, hermitePos = CM.hermitePos, hermiteTangent = CM.hermiteTangent,
+       copyEdgeProps = CM.copyEdgeProps, buildContext = CM.buildContext, groundAt = CM.groundAt }
+
+-- Build an N-node polyline as ONE proposal.
+--
+-- execEdge handles the two-point case and stays untouched -- it is the path M9
+-- verified, and rewriting it to be general would put that result at risk for no
+-- gain. This is the captured-from-UI case: a drawn road tessellates into three
+-- or more nodes, and collapsing it to first-and-last would replicate a straight
+-- line where the player drew a curve. Both peers would then agree on the wrong
+-- road and the hash check would PASS, which is the worst kind of failure -- a
+-- green test over a visibly broken feature.
+--
+-- All nodes and edges go in a single proposal so the segments share nodes and
+-- come out as one connected road. Emitting one command per segment would build
+-- disconnected stubs, because each command mints its own placeholder nodes.
+-- Replay a captured road/track as ONE proposal, resolving every endpoint by
+-- POSITION.
+--
+-- Endpoints arrive as coordinates, never entity ids. For each one:
+--   1. a node already there  -> reuse it (this is how roads connect end-on)
+--   2. lands mid-span on an edge -> SPLIT that edge: remove it, re-add both
+--      halves around a new node. buildProposal refuses a bare mid-span node,
+--      which is exactly why junctions failed.
+--   3. otherwise -> plant a new node
+--
+-- The split is recreated on every peer rather than shipped. A host snapping onto
+-- an existing road splits nothing and captures no removal list, so there was
+-- never one to send -- which is why looking for edgesToRemove in the proposal
+-- found only garbage.
+-- ---------- constructions: hybrid replication, station edits, edge demolish, capture polls ----------
+-- Lives in res/scripts/mp/cons.lua.
+CM.boot("mp.cons")
+-- ---------- vehicles: cross-peer identity, names/colours, vehicle commands, buy, replace ----------
+-- Lives in res/scripts/mp/vehicles.lua.
+CM.boot("mp.vehicles")
+CM.boot("mp.action_sounds")
+-- ---------- lines: cross-peer identity, create/update/delete ----------
+-- Lives in res/scripts/mp/lines.lua.
+CM.boot("mp.lines")
+-- ---------- constructions: native replay (CONP / CONX), CONFAIL, LOAN ----------
+-- Lives in res/scripts/mp/conx.lua.
+CM.boot("mp.conx")
+-- ---------- terraforming and terrain painting (TERRAINCAP -> TERRAIN) ----------
+-- Lives in res/scripts/mp/terrain.lua.
+CM.boot("mp.terrain")
+-- ---------- the asset brush (ASSETCAP -> ASSETS) ----------
+-- Lives in res/scripts/mp/assets.lua.
+CM.boot("mp.assets")
+-- ---------- Sandbox mode's tools: towns (TOWNC) ----------
+-- Lives in res/scripts/mp/sandbox.lua (after mp.cons: it uses CM.unescName).
+CM.boot("mp.sandbox")
+local function execute(c)
+	-- any other command may edit the road/rail network: EDEMO's node index
+	-- (cons.lua) is only reused across consecutive bulldozes
+	if c.op ~= "EDEMO" then CM.edemoCache = nil end
+	-- companies: the command's company, as the registry has it at this stamp
+	CM.cmAttribute(c)
+	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
+	elseif c.op == "CONU" then CM.execConU(c)
+	elseif c.op == "FENCE" then CM.execFence(c)
+	elseif c.op == "ROADP" then CM.execPolyline(c)
+	elseif c.op == "ROAD" or c.op == "RAIL" then CM.execEdge(c)
+	elseif c.op == "CON" then CM.execCon(c)
+	elseif c.op == "DEMOLISH" then CM.execDemolish(c)
+	elseif c.op == "HEALCHK" then CM.execHealCheck(c)
+	elseif c.op == "LREADBACK" then CM.execLineReadback(c)
+	elseif c.op == "EDEMO" then CM.execEdgeDemolish(c)
+	elseif c.op == "CONFAIL" then CM.execConFail(c)
+	elseif c.op == "VBUY" then CM.execVBuy(c)
+	elseif c.op == "VREPL" then CM.execVReplace(c)
+	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" or c.op == "VSTOP" then CM.execVehCmd(c)
+	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
+	elseif c.op == "VNAME" then CM.execSetName(c)
+	elseif c.op == "VCOLOR" then CM.execSetColor(c)
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" or c.op == "LSPARE" then
+		-- behind any stop / construction replay still in flight: a line update
+		-- that re-adds a replaced stop must find that stop already there
+		if CM.conxBusy or #CM.conxQueue > 0 then
+			CM.conxQueue[#CM.conxQueue + 1] = { c = c, notBefore = CM.gameTime() or 0 }
+			log(string.format("%s seq=%s: a replay is in flight -- queued behind it (%d waiting)", tostring(c.op), tostring(c.seq), #CM.conxQueue))
+		else
+			CM.execLine(c)
+		end
+	elseif c.op == "LOAN" then CM.execLoan(c)
+	elseif c.op == "SETDATE" or c.op == "CALSPEED" then CM.execCalendar(c)
+	elseif c.op == "HASHEVERY" then CM.execHashEvery(c)
+	elseif c.op == "SPEEDVOTE" then CM.execSpeedVote(c)
+	elseif c.op == "TERRAIN" then CM.execTerrain(c)
+	elseif c.op == "ASSETS" then CM.execAssets(c)
+	elseif c.op == "TOWNC" then CM.execTownCreate(c)
+	elseif c.op == "CMJOIN" or c.op == "CMLEAVE" or c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW"
+		or c.op == "CMNAME" or c.op == "CMOPEN" or c.op == "CMCOLOR" then CM.execCompanyCmd(c)
+	else log("unknown op: " .. tostring(c.op)) end
+end
+
+function CM.groundAt(x, y)
+	local z = 0
+	pcall(function() z = game.interface.getHeight({ x, y }) or 0 end)
+	return z or 0
+end
+LS.groundAt = CM.groundAt   -- the LS export above ran before this was defined
+
+-- ---------- command reliability (NACK + resend), encode/decode, scheduleLocal, onLine, pollEvents ----------
+-- Lives in res/scripts/mp/net.lua.
+CM.boot("mp.net")
+-- ---------- roadside stops (edge objects) and native-shape stop replay ----------
+-- Lives in res/scripts/mp/stops.lua.
+CM.boot("mp.stops")
+-- ---------- inject reader (pollInject) ----------
+-- Lives in res/scripts/mp/inject.lua.
+CM.boot("mp.inject")
+-- ---------- session speed, PID pacing, catch-up, load gate ----------
+-- Lives in res/scripts/mp/pacing.lua.
+CM.boot("mp.pacing")
+-- ---------- other players' cursors as coloured ground circles (cosmetic) ----------
+-- Lives in res/scripts/mp/cursors.lua.
+CM.boot("mp.cursors")
+CM.boot("mp.previews")
+-- Fences compatibility exports M.bind rather than a factory, so it gets CM.boot's
+-- guard written out: a missing or failing file turns multiplayer off with a
+-- message instead of raising out of the game script (boot_resilience_test).
+if not CM.bootFailed then
+	print("[ls-boot] loading mp.fences_compat")
+	local ok, fences = pcall(require, "mp/fences_compat")
+	if not ok then
+		CM.bootFail("Transport Fever 2 Multiplayer: require('mp/fences_compat') failed: " .. CM.bootText(fences))
+	elseif type(fences) ~= "table" or type(fences.bind) ~= "function" then
+		CM.bootFail("Transport Fever 2 Multiplayer: require('mp/fences_compat') returned a " .. type(fences) .. " without bind (another mod may have replaced require)")
+	else
+		local ok2, err = pcall(fences.bind, CM, K, log)
+		if not ok2 then
+			CM.bootFail("Transport Fever 2 Multiplayer: module mp.fences_compat failed while loading: " .. CM.bootText(err))
+		end
+	end
+end
+-- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
+-- Lives in res/scripts/mp/stats.lua.
+CM.boot("mp.stats")
+-- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
+CM.boot("mp.resync")
+-- ---------- peer quality and session health ----------
+-- Diagnostic and admission-facing; it does not alter lockstep state.
+CM.boot("mp.health")
+-- ---------- desync check ----------
+function CM.compareAt(stamp)
+	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
+	if not CM.myHashes[stamp] then return end
+	for o, pr in pairs(CM.peers) do
+		local h = pr.hashes[stamp]
+		if h and not CM.comparedAt[stamp][o] then
+			CM.comparedAt[stamp][o] = true
+			CM.compareOne(stamp, o, h, pr.details[stamp])
+		end
+	end
+end
+
+-- Defined here, after broadcast(): a CM function above it would bind a nil
+-- global of that name (luacheck's use-before-definition class of bug).
+-- called from checkHash right after the hash is broadcast
+function CM.vposShip(stamp)
+	-- off for good past K.VPOS_MAX_VEHICLES (hash.lua CM.vposCapReached), saved with the world
+	if CM.vposOff then
+		if not CM.vposOffSaid then
+			CM.vposOffSaid = true
+			log(string.format("VPOS: the vehicle drift check is off in this world -- it had %d vehicles, over the cap of %d",
+				CM.vposOff, K.VPOS_MAX_VEHICLES))
+		end
+		return
+	end
+	local pts, st = CM.lastVposRaw or {}, CM.lastVposT or -1
+	CM.vposMine[stamp] = { s = st, pts = pts }
+	vposPrune(CM.vposMine, K.VPOS_KEEP)
+	local m = math.max(1, math.ceil(#pts / K.VPOS_PER_PART))
+	for i = 1, m do
+		local seg = {}
+		for j = (i - 1) * K.VPOS_PER_PART + 1, math.min(i * K.VPOS_PER_PART, #pts) do
+			seg[#seg + 1] = string.format("%.1f,%.1f,%s", pts[j][1], pts[j][2], pts[j][3] or "-")
+		end
+		CM.broadcast(string.format("LSVPOS t=%d s=%.1f o=%s i=%d m=%d n=%d d=%s",
+			stamp, st, K.INSTANCE, i, m, #pts, #seg > 0 and table.concat(seg, ";") or "-"))
+	end
+	-- a peer's parts may already be waiting
+	for o in pairs(CM.vposPeer) do CM.vposCompare(stamp, o) end
+end
+
+-- BIG MAPS HASH, JUST RARELY. Until 2026-09-15 the hash was switched OFF for the
+-- whole game above vanilla's largest size (96 x 96, or 192 on an axis), because on
+-- a 224-tile map (27k edges) it measured 3.0-3.5 s per stamp -- a freeze every few
+-- minutes. That bought smoothness with the thing the hash exists for: those were
+-- exactly the games running with NO desync detection at all.
+--
+-- The cost-proportional cadence (hash.lua) makes the trade unnecessary: the
+-- interval follows the measured cost, so a huge world hashes seldom instead of
+-- never. The starting interval still comes from the EDGE COUNT, which every
+-- instance reads from the same save -- that is what keeps the stamp grids
+-- identical, and it is why this decision must never be made from a machine's own
+-- speed. The leader then moves everyone with a stamped HASHEVERY.
+--
+-- A 224-tile map starts at 12 * 14 = 168 units and settles near the 576 rung at
+-- 3.5 s a stamp: one hitch roughly every ten minutes at 1x, against none before.
+local function checkHash(now)
+	-- ALONE, NO HASH (2026-09-17, user): with nobody to compare against, the walk
+	-- over every vehicle, construction and edge is a hitch for nothing. The clock
+	-- is still tracked so the first stamp after a peer arrives is judged by a
+	-- real crossing below, never by the solo stretch before it.
+	if not CM.hashPeersPresent() then
+		CM.hashPrevNow = now
+		if not CM.hashSoloNoted then CM.hashSoloNoted = true; log("hash: no other player in this game -- the world hash is off until one joins") end
+		return
+	end
+	if CM.hashSoloNoted then CM.hashSoloNoted = nil; log("hash: another player is in -- the world hash is on") end
+	-- THE AGREED GRID (hash.lua CM.hashStampOf): CM.hashEvery from the map size on
+	-- the first hash (the same on every instance: same save; the base interval
+	-- until then), then whatever the leader's HASHEVERY moved every instance to.
+	local stamp = CM.hashStampOf(now)
+	-- A HASH IS A SAMPLE AT A SIM TIME, not a property of the stamp (2026-09-16).
+	-- The stamp only says which interval the sample fell in; the world it describes
+	-- is the world at `now`. A game that ENTERS an interval part way through --
+	-- every game does, on the first update after a load -- would publish a sample
+	-- from the middle of it under the same stamp as a game that crossed its start,
+	-- and the two are not the same world: the hot join of 2026-09-16 had the host
+	-- sample stamp 0 at 1.8 and the joiner (which loaded a save taken at 31.4) at
+	-- 31.6, 30 game units of town growth apart, and it read as a desync at the very
+	-- first stamp. So a stamp is published only when this game watched its clock
+	-- CROSS it. The hash is still taken (the first one sets the cadence from the
+	-- edge count, hash.lua) and still shown on the dash; it is simply nobody
+	-- else's to compare.
+	local sawCrossing = CM.hashPrevNow ~= nil and CM.hashPrevNow < stamp
+	CM.hashPrevNow = now
+	if lastHashAt == stamp then return end
+	lastHashAt = stamp
+	local ph0 = os.clock()
+	local h, detail = worldHash(now)
+	do  -- PERF: the hash walks every vehicle, construction and edge -- the one
+		-- O(world) cost the mod adds; measured, not estimated, so a big map's
+		-- hitch is visible in the log as ms per stamp
+		local dt = (os.clock() - ph0) * 1000
+		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
+		pf.n = pf.n + 1; pf.sum = pf.sum + dt
+		-- the split of the DEAREST stamp, not whichever hashed last: on the
+		-- 49,000-tile world the cheap stamps read 1.6 s and the dear ones 8.8 s,
+		-- and it was always a cheap one whose lanes reached the log (2026-09-23)
+		if dt > pf.max then pf.max = dt; CM.hashPartsWorst = CM.hashPartsMs end
+		CM.perfHash = pf
+	end
+	if not sawCrossing then
+		CM.dashLastDetail = detail
+		log(string.format("hash t=%d: this game entered that interval at %.1f rather than crossing its start (a load) -- the sample is not comparable with anyone else's and is not published", stamp, now))
+		return
+	end
+	CM.myHashes[stamp] = h
+	CM.myDetails[stamp] = detail
+	CM.pruneOldest(CM.myHashes, K.STAMP_KEEP)
+	CM.pruneOldest(CM.myDetails, K.STAMP_KEEP)
+	CM.pruneOldest(CM.comparedAt, K.STAMP_KEEP)
+	CM.pruneOldest(CM.vposDone, K.STAMP_KEEP * 4)   -- keyed per peer per stamp
+	for _, pr in pairs(CM.peers) do
+		CM.pruneOldest(pr.hashes, K.STAMP_KEEP)
+		CM.pruneOldest(pr.details, K.STAMP_KEEP)
+	end
+	local pp0 = os.clock()
+	CM.broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
+	pcall(CM.vposShip, stamp)
+	CM.dashLastDetail = detail
+	-- verdict is set by compareAt; a fresh agreeing tick clears it there
+	-- One shared comparison, used from here and from the LSHASH handler, so the
+	-- check fires whichever side's hash lands second.
+	CM.compareAt(stamp)
+	do  -- what the stamp costs AFTER the hash: the LSHASH frame, the drift
+		-- positions and the comparison (O(vehicles), O(peers)); the hash timer
+		-- above stops at worldHash and this was never in the PERF line
+		local dp = (os.clock() - pp0) * 1000
+		local pp = CM.perfPost or { n = 0, sum = 0, max = 0 }
+		pp.n = pp.n + 1; pp.sum = pp.sum + dp; if dp > pp.max then pp.max = dp end
+		CM.perfPost = pp
+	end
+	-- what this stamp cost, and on the leader the interval that cost calls for
+	-- (hash.lua CM.hashCostNote, CM.hashCadenceTick)
+	CM.hashCostNote((os.clock() - ph0) * 1000)
+	pcall(CM.hashCadenceTick, now)
+end
+
+if CM.bootFailed then
+	print("[ls-boot] Transport Fever 2 Multiplayer is OFF for this game (" .. CM.bootText(CM.bootFailed) .. ") -- everything else loads normally")
+	function data() return {} end
+	return
+end
+print("[ls-boot] all modules loaded")
+
+-- THE TOOLBAR BUTTON (2026-09-27): a toggle in the game's main toolbar, beside
+-- Big Maps' minimap button, that shows and hides the Multiplayer window -- the
+-- same thing as Ctrl+Shift+D, through the same one-byte tpf2mp_dash.txt the
+-- menu DLL's chord flips and the panel's poll reads, so the three never disagree.
+-- GUI state only; a dedicated server (no screen) never adds it.
+CM.MP_BUTTON_ICON = "ui/button/mp_multiplayer@2x.tga"   -- tools/make_mp_button_icon.py
+CM.MP_BUTTON_TRIES = 600   -- frames to wait for the toolbar
+function CM.dashSetShown(shown)
+	local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+	if f then f:write(shown and "1\n" or "0\n"); f:close() end
+	local D = CM.dash
+	if D and D.win then
+		if not shown and D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
+		D.shown = shown
+		D.win:setVisible(shown, false)
+	end
+	CM.mpButtonSync(shown)
+end
+-- the button follows the window when something else moved it (the chord, the "x")
+function CM.mpButtonSync(shown)
+	if CM.mpButton and CM.mpButtonShown ~= shown then
+		CM.mpButtonShown = shown
+		pcall(function() CM.mpButton:setSelected(shown, false) end)
+	end
+end
+function CM.mpButtonInstall()
+	local main = api.gui.util.getById("mainButtonsLayout")
+	local layout = main and main:getItem(0)
+	if not layout then return false end
+	-- sized like the game's disk buttons: a 60 px disk (style_sheet/mp_lockstep.lua
+	-- mpToolbarDisk) around a 34 px icon. The button's size is its CONTENT, the
+	-- style's 13 px padding goes outside it: sizing the button 60 made an 86 px
+	-- disk with the icon off to one side (seen in game, 2026-09-27).
+	local icon = api.gui.comp.ImageView.new(CM.MP_BUTTON_ICON)
+	icon:setMinimumSize(api.gui.util.Size.new(34, 34))
+	icon:setMaximumSize(api.gui.util.Size.new(34, 34))
+	local button = api.gui.comp.ToggleButton.new(icon)
+	button:setTooltip("Multiplayer (Ctrl+Shift+D)")
+	button:setStyleClassList({ "mpToolbarDisk" })
+	button:setMinimumSize(api.gui.util.Size.new(34, 34))
+	button:setMaximumSize(api.gui.util.Size.new(34, 34))
+	layout:insertItem(button, 0)
+	CM.mpButton = button
+	CM.mpButtonSync(not (CM.dash and CM.dash.shown == false))
+	button:onToggle(function(on) CM.dashSetShown(on == true) end)
+	print("[ls-gui] toolbar button added")
+	return true
+end
+-- retried each frame until the toolbar exists; an error stops the retries, so a
+-- half-built button is never added twice
+function CM.mpButtonTick()
+	if CM.mpButton or (CM.mpButtonTries or 0) >= CM.MP_BUTTON_TRIES then return end
+	CM.mpButtonTries = (CM.mpButtonTries or 0) + 1
+	local ok, err = pcall(CM.mpButtonInstall)
+	if not ok then
+		CM.mpButtonTries = CM.MP_BUTTON_TRIES
+		print("[ls-gui] could not add the toolbar button: " .. tostring(err))
+	end
+end
+
+function data()
+	return {
+		update = function()
+			CM.ticks = CM.ticks + 1
+			if not K.INSTANCE and not CM.detectInstance() then return end
+			-- WORLD TOKEN: which world this game is in, one line, rewritten on
+			-- the first sim tick of every load. The menu DLL cannot see a NEW
+			-- GAME (it never reaches the engine's StartSavegame) and a CONTINUE
+			-- carries no name it could recognise, so the host's menu reads a
+			-- CHANGE here as "this game has moved to another world" and pushes
+			-- it to everyone. The pid addresses the file to THIS game: a second
+			-- instance sharing the data dir must not be taken for us. Written
+			-- from the sim side only -- the dashboard's guiUpdate runs this same
+			-- chunk in its own Lua state, and a second value per load would read
+			-- as a second switch -- and BEFORE the recovery hold below, so a
+			-- resync's own load is stamped while the menu knows it is busy.
+			if not CM.worldGenWritten then
+				CM.worldGenWritten = true
+				pcall(function()
+					local f = io.open(K.BASE .. "tpf2mp_world_gen.txt", "w")
+					if not f then return end
+					-- the wall clock, this process's own clock, the address of a
+					-- fresh table and a draw: two loads cannot land on one value,
+					-- not even two in the same second of a run that never reseeded
+					local uniq = tostring({}):gsub("%W", "")
+					f:write("pid=" .. tostring(K.PROCESS_ID or "") .. "\n")
+					f:write("gen=" .. os.time() .. "-"
+						.. math.floor((os.clock() or 0) * 1000) % 1000000 .. "-"
+						.. uniq .. "-" .. math.random(0, 999999) .. "\n")
+					f:close()
+				end)
+			end
+			-- Recovery is checked before every command producer, including deferred
+			-- company repairs. Recovery control uses the separate lobby connection.
+			if CM.autoSyncPump(CM.gameTime() or 0) then return end
+			CM.pollEvents()
+			pcall(CM.sampleSimRate)
+			if CM.cmRepairAt then pcall(CM.cmVehRecheck) end              -- companies: lines follow their vehicles after a switch
+			if CM.cmSwitchWanted then pcall(CM.cmLoadSwitchTick) end      -- companies: a switch waits for a world that answers
+			if CM.ticks % 60 == 0 or not K.INSTANCE then
+				if not CM.detectInstance() then return end
+				-- companies (companies.lua): the save's record is applied here, on the
+				-- sim thread with the engine API up, not inside load() itself; then this
+				-- game joins the session once it is live (not while it loads or catches
+				-- up), and a player gone from the lobby is let go
+				pcall(CM.cmEnsure)
+				pcall(CM.cmJoinTick, CM.peerSeen and not CM.catchingUp2 and (CM.behindBy or 0) <= 2)
+				pcall(CM.cmLeaveTick)
+				-- WORLD INTEGRITY, once per load: a road edge without its
+				-- TransportNetwork component is a half-built leftover of a failed
+				-- proposal (the 2026-09-09 rail crossing left two); the engine
+				-- asserts and dies the moment the UI touches one. Say so loudly, so
+				-- a poisoned save is recognised before it spreads through the relay.
+				if not CM.integrityChecked and CM.ticks >= 60 then   -- in the every-60-ticks block: "== 30" never ran
+					CM.integrityChecked = true
+					pcall(function()
+						local bad, n = {}, 0
+						local t = game.interface.getEntities({ radius = 999999 }, { type = "BASE_EDGE", includeData = false }) or {}
+						for _, eid in pairs(t) do
+							n = n + 1
+							local ok, c = pcall(function() return api.engine.getComponent(eid, api.type.ComponentType.TRANSPORT_NETWORK) end)
+							if not ok or c == nil then bad[#bad + 1] = tostring(eid) end
+						end
+						if #bad > 0 then
+							log(string.format("!! WORLD INTEGRITY: %d of %d edges have NO TransportNetwork (%s) -- clicking near them CRASHES the game; this save is damaged, repair or roll back", #bad, n, table.concat(bad, ",")))
+							pcall(dashNote, string.format("!! DAMAGED SAVE: %d broken road edge(s) %s -- clicking near them crashes; repair or roll back", #bad, table.concat(bad, ",")))
+						else
+							log(string.format("world integrity: %d edges, all complete", n))
+						end
+					end)
+				end
+			end
+			if not K.INSTANCE then return end
+
+			local now = CM.gameTime()
+			if not now then return end
+			local upd0 = os.clock()
+
+			-- Both every tick. pollInject at every 10th tick added up to 1.9s of
+			-- pure dead time before a build was even scheduled; a file stat per
+			-- tick is far cheaper than that. First, whether this game is so far
+			-- behind that the player's actions are off (inject.lua).
+			pcall(CM.actionsBlockTick, now)
+			CM.pollInject()
+			local lap = CM.perfLane("inject", upd0)
+			-- NO WORLD SCANS ON A TIMER. The construction and stop polls walked every
+			-- construction and every edge object on the map every 10 steps -- ~300 ms of frozen
+			-- simulation each on a big map (2026-09-12) -- to find builds the slice already
+			-- announces. They run once at load (what the save holds is known, not new) and as a
+			-- one-shot CATCH-UP: after a NATIVE line or a not-armed stop (the slice left a build
+			-- native), or after update() stalled long enough in a multiplayer session for the
+			-- status file to go stale (over 15 s, and the slice then builds natively). Replays
+			-- land by a lookup at their own position (CM.landReplays).
+			if not CM.consPrimed then CM.pollNewConstructions() end
+			if not CM.stopPrimed then CM.pollStops() end
+			CM.landReplays()
+			do
+				local wall = os.time()
+				local mp = CM.peerSeen or (tonumber(CM.rosterPlayers) or 0) >= 2
+				if mp and CM.lastUpdWall and wall - CM.lastUpdWall >= 10 then
+					CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks)
+					log(string.format("update() stalled %d s in a multiplayer session -- catch-up scan due", wall - CM.lastUpdWall))
+				end
+				CM.lastUpdWall = wall
+			end
+			if CM.catchUpAt and CM.ticks >= CM.catchUpAt then
+				CM.catchUpAt = nil
+				log("catch-up scan: constructions and stops")
+				CM.pollNewConstructions()
+				CM.pollStops()
+			end
+			lap = CM.perfLane("scans", lap)
+			if CM.ticks % 15 == 7 then CM.pollLoan() end
+			-- Until the peer's first heartbeat, refresh the status file every 3 ticks rather
+			-- than every 15: the slice decides from it whether a build can be cancelled, and
+			-- the first seconds after a load are exactly when a player starts building.
+			if not CM.peerSeen and CM.ticks % 3 == 1 then
+				pcall(CM.speedRequest)   -- reads the lobby's players= (throttled inside)
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
+					if f then f:write(CM.statusLine(CM.gameTime() or 0)); f:close() end
+				end)
+			end
+			if CM.txRepeatTick then CM.txRepeatTick() end   -- the extra copies of our recent commands
+			if CM.ticks % 10 == 5 then CM.nackScan() end
+			lap = CM.perfLane("misc", lap)
+			CM.flushConPairs()
+			CM.primeConstructions()
+			CM.primeVehKeys()
+			CM.shipParkedBuys()
+			CM.pollVehKeys()
+			lap = CM.perfLane("vehicles", lap)
+			-- diagnostics only, off unless watch_trains=1 (vehicles.lua CM.vehWatchOn)
+			if CM.vehWatchOn() then
+				CM.watchDepartures()
+				CM.watchTrains()
+			end
+			lap = CM.perfLane("watch", lap)
+			CM.drainVehCap()
+			CM.primeLineKeys()
+			CM.pollLineKeys()
+			if CM.spareTick then CM.spareTick() end   -- the pre-made "New line" (lines.lua)
+			if not CM.conxBusy and #CM.conxQueue > 0 then
+				local nowG = CM.gameTime() or 0
+				local head = CM.conxQueue[1]
+				if not head.notBefore or nowG >= head.notBefore then
+					table.remove(CM.conxQueue, 1)
+					CM.runQueued(head.c)
+				end
+			end
+			lap = CM.perfLane("lines", lap)
+			CM.pollConstructionRemovalsSlice()   -- every construction once per K.REMOVAL_POLL_EVERY ticks, in slices (cons.lua)
+			lap = CM.perfLane("removals", lap)
+			-- Orphaned-split heals are NOT swept here any more: a frame-tick sweep healed
+			-- on a different sim step on every instance (desync, 2026-09-12). Each watched
+			-- split is a HEALCHK in the step-locked queue instead (cons.lua CM.watchSplit).
+			CM.scanConstructionEditsSlice()   -- every construction once per K.CON_EDIT_SCAN_EVERY ticks, in slices (cons.lua)
+			lap = CM.perfLane("edits", lap)
+
+			-- the command delay follows the measured round trips (net.lua CM.execDelayTick)
+			if CM.execDelayTick then pcall(CM.execDelayTick) end
+			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
+				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
+				-- every heartbeat, so nobody paces against a peer that must catch up
+				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
+				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
+				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
+				-- hc= our world hash's cost in ms, which the leader sets the hash cadence by
+				-- ak= what we hold of each origin, contiguously (its sent ring prunes by this)
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
+					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "",
+					CM.ackReport and CM.ackReport() or "", CM.resyncToken))
+			end
+
+			lap = CM.perfLane("heartbeat", lap)
+			CM.paceTick(now)
+			CM.ensureRunning()
+			lap = CM.perfLane("pace", lap)
+			pcall(CM.cursorTick)   -- other players' cursors (cursors.lua): cosmetic, never the sim
+			pcall(CM.previewTick)
+			lap = CM.perfLane("cursors", lap)
+
+			-- Commands that asked to be tried again (a VLINE whose line has not
+			-- arrived yet). They were executed once as far as the pump knows, so
+			-- that mark is lifted before they go back in.
+			if CM.retryQueue and #CM.retryQueue > 0 then
+				for _, rc in ipairs(CM.retryQueue) do
+					executed[CM.cmdKey(rc)] = nil
+					CM.queuedKeys = CM.queuedKeys or {}
+					CM.queuedKeys[CM.cmdKey(rc)] = true   -- a copy arriving during the retry is not queued beside it
+					CM.queue[#CM.queue + 1] = rc
+				end
+				CM.retryQueue = {}
+			end
+
+			-- run everything due, in the agreed order
+			if #CM.queue > 0 then
+				table.sort(CM.queue, CM.cmdLess)
+				local keep = {}
+				-- PRE-PASS: DETERMINISTIC targets for a batch. Spreading buys by a
+				-- frame-tick count made departures drift: ticks map to instance-
+				-- specific game-time (review, 2026-09-01). Instead every batched buy
+				-- gets an explicit apply STEP derived only from its agreed stamp and
+				-- its position in the agreed (at, origin, seq) order -- one step
+				-- apart -- and any command stamped at or before the last such buy
+				-- (the batch's line-assigns, lower in the sort) is held until that
+				-- buy plus K.BIND_GUARD_STEPS. Identical on every instance, host
+				-- included (its skipOrigin buys take the same targets, so its
+				-- departures wait for the same step). Targets are sticky per
+				-- command; a NACK resend recomputes the same value from the stamp.
+				do
+					local lastBuyStep = nil
+					-- line key ("origin:seq" of its LCREATE) -> that LCREATE's step, kept ACROSS ticks.
+					-- It used to be rebuilt per pass from whatever sat in the queue together, so
+					-- whether an op waited for its line depended on each instance's own batching:
+					-- a slow tick on A queued B's LCREATE with its two LUPDATEs and applied them 1
+					-- and 5 steps EARLY (target below their own stamp), while B did not
+					-- (2026-09-11, line b:39). Every command passes through a pre-pass before it
+					-- executes, so the create is always recorded before its dependants.
+					CM.lineCreateStep = CM.lineCreateStep or {}
+					local newLineStep = CM.lineCreateStep
+					if CM.ticks % 300 == 0 then
+						local cut = CM.stepOf(now) - 3000
+						for k, s in pairs(newLineStep) do if s < cut then newLineStep[k] = nil end end
+					end
+					for _, c in ipairs(CM.queue) do
+						if not executed[CM.cmdKey(c)] then
+							local st = CM.stepOf(c.at)
+							if c.op == "VBUY" then
+								if not c.notBeforeStep then
+									c.notBeforeStep = math.max(st, (lastBuyStep or (st - 1)) + 1)
+								end
+								if not lastBuyStep or c.notBeforeStep > lastBuyStep then lastBuyStep = c.notBeforeStep end
+							else
+								if lastBuyStep and not c.notBeforeStep and st <= lastBuyStep then
+									c.notBeforeStep = lastBuyStep + K.BIND_GUARD_STEPS
+								end
+								-- A line created earlier in THIS batch is not queryable in the
+								-- step it is issued: createLine materializes on a later sim step
+								-- and its key binds only when the entity appears. Hold the ops and
+								-- assigns that NAME that line until the create's step plus a
+								-- materialize margin, so the stops land before a vehicle is
+								-- assigned to it and the host (native line, already built) fires
+								-- the assignment on the same step as the peers (which must build
+								-- the line first). Matched only against lines born in this batch,
+								-- so an assign to a pre-existing line is untouched; the retry
+								-- paths are the fallback when a stall overshoots this margin.
+								if c.op == "LCREATE" then
+									newLineStep[tostring(c.origin) .. ":" .. tostring(c.seq)] = c.notBeforeStep or st
+								else
+									local dep = (c.op == "LUPDATE" or c.op == "LDELETE") and tostring(c.key)
+										or (c.op == "VLINE") and tostring(c.line) or nil
+									local cs = dep and newLineStep[dep]
+									if cs then
+										local lg = math.max(cs + K.LINE_MATERIALIZE_STEPS, st)   -- a hold only ever delays, never earlier than the stamp
+										-- only a real hold sets a target: a later op on an old line keeps no
+										-- notBeforeStep, so the buy guard above still applies to it
+										if lg > st and (not c.notBeforeStep or c.notBeforeStep < lg) then c.notBeforeStep = lg end
+									end
+								end
+								-- Line assignments land on a step GRID. Depot departures are dispatched
+								-- with frame granularity: two assignments a few steps apart fell into one
+								-- engine batch on the slower-rendering game and into two on the other,
+								-- and two long trains left the same depot in opposite order (a:58/a:59,
+								-- 2026-09-16), while ten trucks assigned on one step never drifted -- on
+								-- one step the engine orders them the same everywhere. So assignments
+								-- due within a grid cell are issued together, on its last step, on
+								-- every instance; a hold above only ever moves this later.
+								if c.op == "VLINE" then
+									local due = c.notBeforeStep or st
+									if due % K.VLINE_GRID_STEPS ~= 0 then due = due + (K.VLINE_GRID_STEPS - due % K.VLINE_GRID_STEPS) end
+									c.notBeforeStep = due
+								end
+							end
+						end
+					end
+				end
+				-- The per-tick cap below is now only WEDGE protection (never N
+				-- buyVehicle in one update); ordering safety comes from the targets.
+				local buysThisTick = 0
+				local deferRest = false
+				for _, c in ipairs(CM.queue) do
+					if deferRest then
+						keep[#keep + 1] = c
+					elseif (c.notBeforeStep or CM.stepOf(c.at)) <= CM.stepOf(now) then
+						if c.op == "VBUY" and buysThisTick >= 1 and not executed[CM.cmdKey(c)] then
+							deferRest = true
+							keep[#keep + 1] = c
+						else
+						local k = CM.cmdKey(c)
+						if CM.queuedKeys then CM.queuedKeys[k] = nil end   -- the queue's copy is done with (net.lua: one copy queued per key)
+						if not executed[k] then
+							executed[k] = true
+							-- remember insertion order so this cannot grow for the life of
+							-- the session; a resend arrives inside the NACK window, far
+							-- fewer than K.EXECUTED_KEEP commands ago
+							executedSeq = executedSeq + 1
+							executedAge[executedSeq] = k
+							if executedSeq % 256 == 0 then
+								local cut = executedSeq - K.EXECUTED_KEEP
+								for i = cut - 255, cut do
+									local oldk = executedAge[i]
+									if oldk then executed[oldk] = nil; executedAge[i] = nil end
+								end
+							end
+							if c.op == "VBUY" then buysThisTick = buysThisTick + 1 end
+							-- MEASUREMENT: how far past its stamp is a command actually
+							-- issued? update() runs per frame while the clock moves in
+							-- 0.2-unit sim steps, so at speed 2-3 the first frame past a
+							-- stamp can be several steps late -- and differently late on
+							-- each instance. Logged on every command, worst case kept in
+							-- the status line (applylag=). If this is routinely > 0 the
+							-- sim-step gate is justified.
+							local lag = now - c.at
+							local lagSteps = CM.stepOf(now) - CM.stepOf(c.at)
+							if lag > (CM.applyLagMax or 0) then CM.applyLagMax = lag end
+							CM.applyCount = (CM.applyCount or 0) + 1
+							if lagSteps > 0 then CM.applyLate = (CM.applyLate or 0) + 1 end
+							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f step=%d late=%d%s",
+								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag, CM.stepOf(now), lagSteps,
+								c.notBeforeStep and string.format(" target=%d", c.notBeforeStep) or ""))
+							execute(c)
+						end
+						end
+					else
+						keep[#keep + 1] = c
+					end
+				end
+				CM.queue = keep
+			end
+
+			-- EVERY tick, not every 50th: checkHash itself dedupes to one hash
+			-- per K.HASH_EVERY_GAMETIME stamp. Sampling on a tick modulus put each
+			-- instance on its own phase of the stamp grid (A hashed t%20 in {0,8},
+			-- B in {4,12}) so the stamp sets were DISJOINT: one SYNC verdict in an
+			-- entire session, and a real 3-edge divergence sat invisible behind it.
+			lap = CM.perfLane("queue", lap)
+			checkHash(now)
+			CM.perfLane("hash", lap)
+			do  -- PERF: whole per-tick script cost (file polls, queue, apply, hash check)
+				local dt = (os.clock() - upd0) * 1000
+				local pf = CM.perfUpd or { n = 0, sum = 0, max = 0 }
+				pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
+				CM.perfUpd = pf
+			end
+
+			if CM.ticks % 15 == 0 then
+				local dash0 = os.clock()
+				-- The dashboard file: one key=value per line, then the recent
+				-- events. Read by guiUpdate in the GUI Lua state.
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_dash_" .. K.INSTANCE .. ".txt", "w")
+					if f then
+						local sp = "?"
+						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
+						-- votes: what the session speed is the mean of; myvote: our own latest vote
+						local myVote = CM.myVoteCast or CM.speedVotes[K.INSTANCE]
+						f:write(string.format("eff=%s\nspeedreq=%s\nvotes=%s\nmyvote=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
+							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.voteWords(CM.voteCounted),
+							myVote and string.format("%g", myVote.v) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+						f:write("gov=" .. ((CM.govFactor and CM.govFactor < 1) and string.format("x%.2f (%s %.1f behind)", CM.govFactor, tostring(CM.govWho or "?"), CM.govWorst or 0) or "-") .. "\n")
+						pcall(function()
+							f:write("health=" .. CM.healthWords() .. "\n")
+							local hf = io.open(K.BASE .. "tpf2mp_health_" .. K.INSTANCE .. ".txt", "w")
+							if hf then hf:write(CM.healthSnapshot(now)); hf:close() end
+						end)
+						-- companies: the registry as the COMPANIES tab shows it (companies.lua
+						-- CM.cmDashLines), and the slice's / other mods' files
+						pcall(function()
+							f:write(table.concat(CM.cmDashLines(), "\n") .. "\n")
+							pcall(CM.cmWritePerms)
+							pcall(CM.cmWriteCompanyMap)
+						end)
+						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
+						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
+							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
+							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
+							CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
+							#CM.queue, tonumber(sp) == 0 and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
+						-- vehicle drift: worst peer's latest mean/max, plus skipped count
+						local vd = "-"
+						if CM.vposOff then
+							vd = string.format("off (over %d vehicles)", K.VPOS_MAX_VEHICLES)
+						elseif CM.vposLast then
+							local parts = {}
+							for o, r in pairs(CM.vposLast) do parts[#parts + 1] = string.format("%s:%.1f/%.1fm", o, r.mean, r.max) end
+							table.sort(parts)
+							if #parts > 0 then vd = table.concat(parts, " ") end
+						end
+						f:write("vdrift=" .. vd .. "\n")
+						-- actionsoff: how far behind this game is while the player's actions are off
+						f:write("actionsoff=" .. (CM.actionsOff and string.format("%.1f", CM.behindBy or 0) or "-") .. "\n")
+						f:write("money=" .. tostring(CM.dashMoney or "-") .. " / loan " .. tostring(CM.dashLoan or "-") .. "\n")
+						-- The GUI used to decide which columns exist by which
+						-- lockstep_dash_<x>.txt files it could open. That is wrong
+						-- across Sandboxie: each boxed instance writes its own copy and
+						-- reads through to the native dir, so the native A never saw
+						-- c, and a stale file from an earlier session showed a dead b
+						-- for minutes. The peer set travels HERE instead, from the
+						-- LSTICK table, with a wall clock so a leftover file can be
+						-- told from a live one.
+						f:write("wall=" .. tostring(os.time()) .. "\n")
+						-- the first desync of this game, for the dashboard
+						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
+						f:write("resynctoken=" .. CM.resyncToken .. "\n")
+						if CM.firstDesync then
+							f:write("desyncwhy=" .. tostring(CM.firstDesync.why):gsub("%c", " ") .. "\n")
+							f:write("desynct=" .. tostring(math.floor(tonumber(CM.firstDesync.t) or 0)) .. "\n")
+						end
+						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
+						-- the command delay (auto or pinned), the worst peer's round trip, and a gap hold in force
+						f:write(string.format("xdelay=%.1f%s\n", CM.execDelayCur or K.EXEC_DELAY, CM.execDelayAuto and " auto" or " fixed"))
+						do
+							local rt = {}
+							for o, pr in pairs(CM.peers) do
+								if pr.srtt then rt[#rt + 1] = string.format("%s:%d+-%dms", o, math.floor(pr.srtt + 0.5), math.floor((pr.rttvar or 0) + 0.5)) end
+							end
+							table.sort(rt)
+							f:write("rtt=" .. (#rt > 0 and table.concat(rt, " ") or "-") .. "\n")
+						end
+						f:write("hold=" .. (CM.gapHold and string.format("%s seq %d", tostring(CM.gapHold.o), CM.gapHold.seq or -1) or "-") .. "\n")
+						local ps = {}
+						for o, pr in pairs(CM.peers) do
+							if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+								ps[#ps + 1] = string.format("%s:%d:%+.1f:%s", o, math.floor(pr.time), now - pr.time, pr.verdict or "-")
+							end
+						end
+						table.sort(ps)
+						f:write("peers=" .. (#ps > 0 and table.concat(ps, ",") or "-") .. "\n")
+						for _, ev in ipairs(CM.dashEvents) do f:write("ev=" .. ev .. "\n") end
+						f:close()
+					end
+				end)
+				-- status for the in-game MP panel (guiUpdate reads it; the gui
+				-- runs in a separate Lua state, so a file IS the channel --
+				-- same as the whole wire)
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
+					if f then
+						f:write(CM.statusLine(now))
+						f:close()
+					end
+				end)
+				CM.perfLane("dash (after update)", dash0)
+			end
+			do
+				local st = CM.stepOf(now)
+				local d = CM.lastStepSeen and (st - CM.lastStepSeen) or 0
+				CM.lastStepSeen = st
+				local sp = -1
+				pcall(function() sp = game.interface.getGameSpeed() or -1 end)
+				CM.stepHist = CM.stepHist or {}
+				local h = CM.stepHist[sp] or {}
+				CM.stepHist[sp] = h
+				if d > 9 then d = 9 end
+				h[d] = (h[d] or 0) + 1
+			end
+			if CM.ticks % 300 == 0 then
+				pcall(function()
+					local parts = {}
+					for sp, h in pairs(CM.stepHist or {}) do
+						local cells, tot, skip = {}, 0, 0
+						for d = 0, 9 do if h[d] then cells[#cells + 1] = d .. ":" .. h[d]; tot = tot + h[d]; if d >= 2 then skip = skip + h[d] end end end
+						parts[#parts + 1] = string.format("speed %s -> steps/update {%s} skipped %.1f%%", tostring(sp), table.concat(cells, " "), tot > 0 and 100 * skip / tot or 0)
+					end
+					table.sort(parts)
+					if #parts > 0 then log("STEPS: " .. table.concat(parts, " | ")) end
+				end)
+				pcall(function()
+					local u, h, pp = CM.perfUpd, CM.perfHash, CM.perfPost
+					if u and u.n > 0 then
+						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s%s",
+							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0,
+							pp and pp.n > 0 and string.format(" | after the hash avg=%.1f ms max=%.1f ms", pp.sum / pp.n, pp.max) or "",
+							(CM.hashPartsWorst or CM.hashPartsMs) and (" | dearest hash: " .. (CM.hashPartsWorst or CM.hashPartsMs)) or ""))
+						-- where it went, per job: avg/max ms per update over the same ticks
+						if CM.perfLanesText then log("PERF lanes: " .. CM.perfLanesText(u.n)) end
+					end
+					CM.perfUpd, CM.perfHash, CM.perfPost, CM.hashPartsWorst = nil, nil, nil, nil
+					CM.perfLanes = nil
+				end)
+				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d",
+					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
+					#CM.queue, CM.desyncs))
+			end
+		end,
+
+		-- the company state, the drift check's off switch, the hash grid and the
+		-- vehicle / line key registries ride in the save (companies.lua cmSaveState,
+		-- hash.lua vposSaveState / hashGridSave, vehicles.lua vehKeysSaveState,
+		-- lines.lua lineKeysSaveState)
+		save = function()
+			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
+			local ok, st = pcall(CM.cmSaveState)
+			-- savedAt: the sim time this save was taken at, EXACTLY. A game that loads
+			-- it asks the host for every command stamped after it (the load gate's
+			-- LSNEED ... save=1, pacing.lua): a clock read after a few ticks of play
+			-- would skip the commands stamped in between (a hole), a clock read too
+			-- early would replay commands the save already holds (a double build).
+			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
+			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
+			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
+			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
+			         actionSounds = CM.actionSoundsSave and CM.actionSoundsSave() or nil,
+			         savedAt = CM.gameTime and CM.gameTime() or nil }
+		end,
+		load = function(s)
+			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and s.actionSounds and CM.actionSoundsLoad then pcall(CM.actionSoundsLoad, s.actionSounds) end
+			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
+			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
+			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
+			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end
+			-- a save from before 2026-09-16 has neither: every save vehicle / line primes s:<id> as before
+			if type(s) == "table" and s.vehKeys and CM.vehKeysLoadState then pcall(CM.vehKeysLoadState, s.vehKeys) end
+			if type(s) == "table" and s.lineKeys and CM.lineKeysLoadState then pcall(CM.lineKeysLoadState, s.lineKeys) end
+		end,
+
+		-- ---------- multiplayer status panel (GUI Lua state) ----------
+		guiHandleEvent = function(id, name, param)
+			if CM.recoveryGuiHeld() then return end
+			pcall(CM.previewGuiEvent, id, name, param)
+		end,
+		guiUpdate = function()
+			guiTick = guiTick + 1
+			-- A DEDICATED SERVER HAS NO SCREEN (2026-09-18): the other players' cursor
+			-- circles, the construction previews and the dashboard are drawn for a player
+			-- who is not there, every frame, on the thread that hands the sim its batches.
+			-- With one joiner in, the server's batch interval crept from 200 to 300 ms at
+			-- lever 1 while its own game-script update stayed under 8 ms. Read once, a
+			-- moment after the world is up; then: no per-frame work, the dashboard every
+			-- 300 ticks (the chat and the players' requests still arrive through it).
+			if CM.dedicatedGui == nil and guiTick >= 30 then
+				CM.dedicatedGui = false
+				local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+				if f then
+					local body = f:read("*a") or ""
+					f:close()
+					CM.dedicatedGui = body:find("dedicated=1", 1, true) ~= nil
+					if CM.dedicatedGui then print("[ls-gui] dedicated server: no cursors, previews or per-frame panel work") end
+				end
+			end
+			if CM.dedicatedGui then
+				if guiTick % 300 ~= 0 then return end
+			else
+				if CM.dedicatedGui == false then CM.mpButtonTick() end
+				if CM.actionSoundsGuiTick then pcall(CM.actionSoundsGuiTick, CM.recoveryGuiHeld()) end
+				-- THE SPARE LINE'S EDITOR, FROM THIS THREAD (lines.lua CM.spareFireWrite,
+				-- 2026-09-19). A New line click opens the editor on a pre-made line the
+				-- game script re-owns to the player on its next tick. The editor's
+				-- callback must run on the UI thread, and its result must name a line
+				-- the player owns: once this state (the UI's own copy of the engine)
+				-- sees the spare as ours, lockstep_lfire.txt tells the slice to fire
+				-- the held callback from the next CommandList::Add on this thread --
+				-- and this rename IS that Add, sent every third frame until the slice
+				-- blanks the file, or four seconds pass.
+				if guiTick % 3 == 0 then
+					pcall(function()
+						local f = io.open(K.BASE .. "lockstep_lfire_req.txt", "r")
+						if not f then return end
+						local body = f:read("*a") or ""
+						f:close()
+						local lid, nameEsc = body:match("^(%d+)%s*(%S*)")
+						lid = tonumber(lid)
+						if not lid then CM.guiFireSince = nil; return end
+						local nowC = os.clock()
+						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid, CM.guiFireOwned = nowC, lid, nil end
+						local function blank(name)
+							local w = io.open(K.BASE .. name, "w")
+							if w then w:close() end
+						end
+						if nowC - CM.guiFireSince > 4 then
+							blank("lockstep_lfire_req.txt"); blank("lockstep_lfire.txt")
+							print(string.format("[ls-gui] spare line %d: the slice never opened the editor on it -- giving up", lid))
+							CM.guiFireSince = nil
+							return
+						end
+						if not CM.guiFireOwned then
+							local mine = false
+							pcall(function()
+								local po = api.engine.getComponent(lid, api.type.ComponentType.PLAYER_OWNED)
+								mine = po and po.player == api.engine.util.getPlayer()
+							end)
+							if not mine then return end
+							CM.guiFireOwned = guiTick
+							return   -- one more frame for the UI's tables to follow the ownership
+						end
+						local g = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						local go = g and (g:read("*a") or "") or ""
+						if g then g:close() end
+						if go == "" and CM.guiFireGone then
+							-- the slice blanked it: fired (or gave up); done
+							blank("lockstep_lfire_req.txt")
+							CM.guiFireSince, CM.guiFireGone = nil, nil
+							return
+						end
+						if go == "" then
+							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+							if w then w:write(tostring(lid)); w:close() end
+							CM.guiFireGone = true
+						end
+						local name = (tostring(nameEsc or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+						if name == "" then name = "Line" end
+						api.cmd.sendCommand(api.cmd.make.setName(lid, name), function() end)
+					end)
+				end
+				-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
+				-- the panel's own twice-a-second refresh
+				if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
+				if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
+				if guiTick % 30 ~= 0 then return end
+			end
+			pcall(function()
+				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
+				-- (Window, Table, TextView, BoxLayout), so the dashboard is built
+				-- from those rather than one text blob: a metrics table with a
+				-- column per instance, a verdict line naming the lanes that
+				-- differ, and the last few notable events harvested from the log.
+				-- Everything comes from lockstep_dash_<a|b>.txt, written every
+				-- 15 ticks by the game-script state.
+				-- The lobby's folder: the per-user one when a lobby has run there, else the
+				-- game folder's. Never fall back to an older inbox while a lobby is still starting.
+				function CM.netDir()
+					if CM.netDirCached then return CM.netDirCached end
+					local cands = {}
+					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
+					if ok and la then cands[#cands + 1] = la .. "/tpf2mp/netpunch" end
+					cands[#cands + 1] = "netpunch"
+					for _, d in ipairs(cands) do
+						local f = io.open(d .. "/lobby_out.jsonl", "r")
+						if f then f:close(); CM.netDirCached = d; return d end
+					end
+					-- A map can load before the host creates its first lobby.
+					return nil
+				end
+				function CM.chatSend(text)
+					local d = CM.netDir()
+					if not d then return false end
+					local f = io.open(d .. "/lobby_in.jsonl", "a")
+					if not f then return false end
+					local esc = tostring(text):gsub("\\", "\\\\"):gsub('"', '\\"')
+					f:write('{"cmd":"chat","text":"' .. esc .. '"}' .. string.char(10))
+					f:close()
+					return true
+				end
+				-- Last n chat lines from lobby_out.jsonl, read incrementally from a
+				-- remembered offset (the file also carries roster/transfer events
+				-- and grows all session; the first read starts 16 KB from the end).
+				CM.chatLines = CM.chatLines or {}
+				function CM.chatTail(n)
+					local d = CM.netDir()
+					if not d then return CM.chatLines end
+					local f = io.open(d .. "/lobby_out.jsonl", "rb")
+					if not f then return CM.chatLines end
+					local size = f:seek("end") or 0
+					if CM.chatOff == nil or CM.chatOff > size then
+						CM.chatOff = math.max(0, size - 16384)
+						CM.chatLines = {}
+					end
+					f:seek("set", CM.chatOff)
+					local chunk = f:read("*a") or ""
+					f:close()
+					CM.chatOff = size
+					for line in chunk:gmatch("[^\n]+") do
+						if line:find('"type":"chat"', 1, true) or line:find('"type": "chat"', 1, true) then
+							local from = line:match('"from":%s*"([^"]*)"') or "?"
+							local text = line:match('"text":%s*"(.-)",%s*"ts"') or line:match('"text":%s*"(.-)"}') or ""
+							text = text:gsub('\\"', '"'):gsub("\\\\", "\\")
+							-- "!..." lines are panel-to-panel notices (the host's
+							-- "!hotjoin" while it saves for a newcomer), not chat:
+							-- the title-menu panel shows them as its status line;
+							-- in the game they were repeated on every save (2026-09-10)
+							if text:sub(1, 1) == "!" then text = nil end
+							if text then CM.chatLines[#CM.chatLines + 1] = from .. ": " .. text end
+							while #CM.chatLines > n do table.remove(CM.chatLines, 1) end
+						end
+					end
+					return CM.chatLines
+				end
+				-- The chat view is a plain TextView, which does not wrap: a long
+				-- message ran off the side of the window and was unreadable. Break
+				-- at the last space that fits, hard-break a word longer than the
+				-- limit, and indent the continuation so "name:" still starts a
+				-- message. Width is in BYTES, so a line of non-ASCII wraps a little
+				-- early -- harmless, and it keeps this off the per-frame path.
+				function CM.chatWrap(lines, width)
+					width = width or 52   -- the 492 px log holds about 52 wide characters (64 ran off it)
+					if width < 12 then width = 12 end
+					local out = {}
+					for _, line in ipairs(lines) do
+						while #line > width do
+							local cut = nil
+							for i = width, math.floor(width / 2), -1 do
+								if line:byte(i) == 32 then cut = i break end
+							end
+							cut = cut or width
+							out[#out + 1] = (line:sub(1, cut):gsub("%s+$", ""))
+							line = "    " .. (line:sub(cut + 1):gsub("^%s+", ""))
+						end
+						out[#out + 1] = (line:gsub("%s+$", ""))
+					end
+					return out
+				end
+				local function readDash(inst)
+					local bases = { K.BASE }
+					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
+					for _, base in ipairs(bases) do
+						local f = io.open(base .. "lockstep_dash_" .. inst .. ".txt", "r")
+						if f then
+							local kv, ev = {}, {}
+							for line in f:lines() do
+								local k, v = line:match("^(%w+)=(.*)$")
+								if k == "ev" then ev[#ev + 1] = v
+								elseif k == "co" then kv.coList = kv.coList or {}; kv.coList[#kv.coList + 1] = v
+								elseif k then kv[k] = v end
+							end
+							f:close()
+							if next(kv) then return kv, ev end
+						end
+					end
+					return nil
+				end
+				-- Which instances are in the session: ourselves, every peer our own
+				-- game-script state hears LSTICKs from (the peers= line), and any
+				-- other instance whose dash file on this machine is FRESH (its wall
+				-- clock within 30 s of ours). Not "whatever files exist": across
+				-- Sandboxie each box has its own copy of the data dir, so the native
+				-- instance never sees a boxed one's file, and a stale file is a dead
+				-- session (review, 2026-09-01: A showed a+b, B and C showed a+b+c).
+				-- the GUI state never runs the engine-side identity detection: read
+				-- the identity file here, or every instance's window thinks it is "a"
+				-- (B's "new company" click went into lockstep_inject_a.txt, 2026-09-09)
+				-- Re-read every ~2 s, not once: the GUI state can start before the
+				-- bridge rewrites the identity file, and then read LAST session's
+				-- letter. A host that had joined as "b" earlier in the day kept
+				-- "B (you)", an empty status, speed "-", and its clicks went into
+				-- lockstep_inject_b.txt, which nothing on that machine reads
+				-- (2026-09-22). detectInstance returns early when unchanged.
+				CM.guiIdentityTick = (CM.guiIdentityTick or 0) + 1
+				if not K.INSTANCE or CM.guiIdentityTick % 4 == 1 then pcall(CM.detectInstance) end
+				local own = K.INSTANCE or "a"
+				local ownKv = readDash(own)
+				local ownWall = ownKv and tonumber(ownKv.wall) or nil
+				local peerInfo = {}
+				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
+					for o, pt, sk, vd in ownKv.peers:gmatch("(%a+):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
+						peerInfo[o] = { t = pt, skew = sk, verdict = vd }
+					end
+				end
+				local present, fresh = {}, {}
+				local letters, seenL = {}, {}
+				for l in ("abcdefgh"):gmatch(".") do letters[#letters + 1] = l; seenL[l] = true end
+				if not seenL[own] then letters[#letters + 1] = own; seenL[own] = true end
+				for o in pairs(peerInfo) do if not seenL[o] then letters[#letters + 1] = o; seenL[o] = true end end
+				for _, letter in ipairs(letters) do
+					local isPresent = (letter == own) or (peerInfo[letter] ~= nil)
+					local kv = (letter == own) and ownKv or readDash(letter)
+					if kv then
+						local w = tonumber(kv.wall)
+						if letter == own or (w and ownWall and math.abs(ownWall - w) <= 30) then
+							fresh[letter] = kv
+							isPresent = true
+						end
+					end
+					if isPresent then present[#present + 1] = letter end
+				end
+				if #present == 0 then present = { own } end
+				local colsKey = table.concat(present)
+				local D = CM.dash
+				if D and D.win and D.colsKey ~= colsKey then
+					pcall(function() D.win:setVisible(false, false) end)   -- the set of players changed: rebuild
+					CM.dash = nil; D = nil
+				end
+				if not D or not D.win then
+					D = {}
+					CM.dash = D
+					D.cols = present
+					D.colsKey = colsKey
+					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "xdelay", "rtt", "hold", "vdrift", "money" }
+					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "paused",
+					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied",
+					             xdelay = "command delay", rtt = "round trip", hold = "waiting for command",
+					             vdrift = "vehicle drift mean/max", money = "balance / loan" }
+					D.cells = {}
+					D.table = api.gui.comp.Table.new(1 + #D.cols, "NONE")
+					local head = { api.gui.comp.TextView.new("") }
+					for _, letter in ipairs(D.cols) do head[#head + 1] = api.gui.comp.TextView.new(string.upper(letter)) end
+					D.table:addRow(head)
+					for _, key in ipairs(D.rows) do
+						local row = { api.gui.comp.TextView.new(D.labels[key]) }
+						D.cells[key] = {}
+						for _, letter in ipairs(D.cols) do
+							local cell = api.gui.comp.TextView.new("-")
+							D.cells[key][letter] = cell
+							row[#row + 1] = cell
+						end
+						D.table:addRow(row)
+					end
+					D.verdict = api.gui.comp.TextView.new("verdict: -")
+					local box = api.gui.layout.BoxLayout.new("VERTICAL")
+					-- Show/hide (2026-09-09): the stats table and the chat block each
+					-- have a toggle; Ctrl+Shift+D still hides the whole window.
+					local function toggleBtn(label, fn)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new((label:gsub("^%s+", ""):gsub("%s+$", "")):upper()), true)
+						b:onClick(fn)
+						return b
+					end
+					-- Sections as tabs (2026-09-16): lobby, stats, chat, companies and speed
+					-- show one at a time. A section's button opens it and closes the
+					-- others; the open section's button closes it. CM.dashTab survives a
+					-- rebuild of the window (false = every section closed).
+					local TABS = { { "lobby", "dashShowLobby", "SESSION" }, { "chat", "dashShowChat", "CHAT" },
+					               { "companies", "dashShowCompanies", "COMPANIES" }, { "speed", "dashShowSpeed", "SPEED" },
+					               { "stats", "dashShowStats", "STATUS" } }
+					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
+					local function applyTabs()
+						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+						-- a chat input left open behind a hidden chat would keep taking keys
+						if not CM.dashShowChat and D.chatOpen and CM.chatCloseInput then pcall(CM.chatCloseInput) end
+						pcall(function() D.lobbyBox:setVisible(CM.dashShowLobby, false) end)
+						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
+						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
+						D.speedShown = nil   -- the GUI tick re-applies the speed row
+						for name, label in pairs(D.tabLabels or {}) do
+							pcall(function() label:setText(name == "lobby" and "SESSION" or name == "stats" and "STATUS" or string.upper(name)) end)
+							local button = D.tabButtons and D.tabButtons[name]
+							if button then pcall(function() button:setStyleClassList(CM.dashTab == name and { "mpDashTab", "mpDashSelected" } or { "mpDashTab" }) end) end
+						end
+					end
+					local function selectTab(name)
+						CM.dashTab = (CM.dashTab ~= name) and name or false
+						applyTabs()
+					end
+					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					-- Hiding is one thing done from two places: this button and the
+					-- window's own title-bar "x" (below). Both write the flag the
+					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
+					local function hideDash()
+						if D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
+						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+						if f then f:write("0\n"); f:close() end
+						D.shown = false
+						if D.win then D.win:setVisible(false, false) end
+						CM.mpButtonSync(false)
+					end
+					D.hideDash = hideDash
+					-- The native close button and the footer share hideDash; keep tabs uncluttered.
+					D.tabLabels = {}; D.tabButtons = {}
+					for _, t in ipairs(TABS) do
+						local name = t[1]
+						D.tabLabels[name] = api.gui.comp.TextView.new(t[3])
+						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
+						D.tabButtons[name] = b
+						b:onClick(function() selectTab(name) end)
+						tog:addItem(b)
+					end
+					local togC = api.gui.comp.Component.new("mpToggles")
+					togC:setLayout(tog)
+					-- far behind the other games, the player's actions are off: said at the very
+					-- top, whatever sections are shown (inject.lua CM.actionsBlockTick)
+					D.alertText = api.gui.comp.TextView.new("")
+					box:addItem(D.alertText)
+					pcall(function() D.alertText:setVisible(false, false) end)
+					box:addItem(togC)
+					local lobbyL = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.lobbyText = api.gui.comp.TextView.new("")
+					lobbyL:addItem(D.lobbyText)
+					lobbyL:addItem(toggleBtn("Host / manage session", function()
+						local f, err = io.open(K.BASE .. "tpf2_lobby_open.txt", "w")
+						if f then f:write("open\n"); f:close()
+						else D.lobbyText:setText("Could not open lobby controls: " .. tostring(err)) end
+					end))
+					local lobbyNav = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					lobbyNav:addItem(toggleBtn("  previous players  ", function()
+						CM.lobbyPage = math.max(1, (CM.lobbyPage or 1) - 1)
+					end))
+					lobbyNav:addItem(toggleBtn("  next players  ", function()
+						CM.lobbyPage = math.min(D.lobbyPages or 1, (CM.lobbyPage or 1) + 1)
+					end))
+					D.lobbyNav = api.gui.comp.Component.new("mpLobbyPages")
+					D.lobbyNav:setLayout(lobbyNav)
+					lobbyL:addItem(D.lobbyNav)
+					D.lobbyBox = api.gui.comp.Component.new("mpLobby")
+					D.lobbyBox:setLayout(lobbyL)
+					box:addItem(D.lobbyBox)
+					-- ---- speed votes (2026-09-12 as the host's speed buttons; every player's since 2026-09-15) ----
+					-- A press appends SPEEDSET <v> to our inject file: our vote for the
+					-- session speed (CM.guiSpeedSet). Every game counts it at its stamp,
+					-- and the session runs at the mean of the votes the line above the
+					-- buttons lists.
+					local function speedVote(v)
+						v = math.max(0.25, math.min(4.5, math.floor(v * 4 + 0.5) / 4))
+						D.speedAsked, D.speedAskedAt = v, os.time()
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write(string.format("SPEEDSET %g", v) .. string.char(10)); f:close() end
+						pcall(function() D.speedText:setText(string.format("your vote: %gx -- the session speed follows in a moment   ", v)) end)
+					end
+					-- -/+0.25 steps our own vote: the last press for a few seconds (the
+					-- dash file lags a press by a second or two), then the vote it reports
+					local function speedVoteBase()
+						if D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5 then return D.speedAsked end
+						return D.speedMine or ((D.speedEff and D.speedEff > 0) and D.speedEff) or D.speedAsked or 1
+					end
+					local svCol = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.speedText = api.gui.comp.TextView.new("session speed: -   ")
+					svCol:addItem(D.speedText)
+					local hsRow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					hsRow:addItem(api.gui.comp.TextView.new("your vote:   "))
+					hsRow:addItem(toggleBtn("  -0.25  ", function() speedVote(speedVoteBase() - 0.25) end))
+					for _, sv in ipairs({ 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5 }) do
+						hsRow:addItem(toggleBtn(string.format("  %g  ", sv), function() speedVote(sv) end))
+					end
+					hsRow:addItem(toggleBtn("  +0.25  ", function() speedVote(speedVoteBase() + 0.25) end))
+					local hsRowC = api.gui.comp.Component.new("mpSpeedVoteButtons")
+					hsRowC:setLayout(hsRow)
+					svCol:addItem(hsRowC)
+					D.speedBox = api.gui.comp.Component.new("mpSpeedVote")
+					D.speedBox:setLayout(svCol)
+					box:addItem(D.speedBox)
+					D.speedShown = nil   -- the GUI tick applies the toggle
+					-- ---- stats, in words (2026-09-11) ----
+					-- A status line (do the worlds match; if not, what differs, since when
+					-- and what to do) and one row per player (stats.lua). The raw counters
+					-- that used to be the whole section stay behind "numbers".
+					D.statusText = api.gui.comp.TextView.new("Checking...")
+					D.ptable = api.gui.comp.Table.new(4, "NONE")
+					D.ptable:addRow({ api.gui.comp.TextView.new("player   "), api.gui.comp.TextView.new("worlds   "),
+						api.gui.comp.TextView.new("clock (game time)   "), api.gui.comp.TextView.new("notes") })
+					D.pcells = {}
+					for _, letter in ipairs(D.cols) do
+						local pc = { name = api.gui.comp.TextView.new(string.upper(letter)), sync = api.gui.comp.TextView.new("-"),
+							clock = api.gui.comp.TextView.new("-"), notes = api.gui.comp.TextView.new("") }
+						D.pcells[letter] = pc
+						D.ptable:addRow({ pc.name, pc.sync, pc.clock, pc.notes })
+					end
+					CM.dashShowNumbers = (CM.dashShowNumbers == true)       -- hidden by default
+					local rawL = api.gui.layout.BoxLayout.new("VERTICAL")
+					rawL:addItem(D.table)
+					rawL:addItem(D.verdict)
+					D.rawBox = api.gui.comp.Component.new("mpStatsNumbers")
+					D.rawBox:setLayout(rawL)
+					local statsL = api.gui.layout.BoxLayout.new("VERTICAL")
+					statsL:addItem(D.statusText)
+					statsL:addItem(D.ptable)
+					statsL:addItem(toggleBtn("Show / hide details", function()
+						CM.dashShowNumbers = not CM.dashShowNumbers
+						pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					end))
+					statsL:addItem(D.rawBox)
+					D.statsBox = api.gui.comp.Component.new("mpStats")
+					D.statsBox:setLayout(statsL)
+					box:addItem(D.statsBox)
+					-- ---- lobby chat (2026-09-09) ----
+					-- The lobby (netpunch) keeps running behind the game; its
+					-- lobby_out.jsonl carries every chat line and lobby_in.jsonl takes
+					-- commands, so the in-game chat is those two files. "/speed x" typed in
+					-- the chat reaches every panel, which writes it into the bridge ctl; the
+					-- host's pacer applies it and broadcasts the session speed (LSEFF). The
+					-- -0.5 / +0.5 / reset / sync buttons went on 2026-09-10, and the session
+					-- speed row with its "speed" toggle on 2026-09-11: it only repeated what
+					-- the host's speed buttons already show.
+					local function speedBtn(label, fn)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new((label:gsub("^%s+", ""):gsub("%s+$", "")):upper()), true)
+						b:onClick(fn)
+						return b
+					end
+					-- ---- companies (rewritten 2026-09-27): companies_gui.lua builds the tab ----
+					CM.coGuiBuild(D, box)
+					local chatL = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.chatText = api.gui.comp.TextView.new("No messages yet.")
+					chatL:addItem(D.chatText)
+					-- The input is CLOSED until the player asks for it (2026-09-12). An
+					-- always-present field kept keyboard focus after a message or a stray
+					-- click, so camera keys went into the chat ("dww", "aaaaaaaaa") and the
+					-- next Enter sent them. Now "type a message" opens it, and Enter (one
+					-- message), Esc, losing focus while empty, or 30 s untouched closes it
+					-- again. A hidden, disabled field cannot take keys.
+					local okI, errI = pcall(function()
+						local mk = api.gui.comp.TextInputField
+						local ok1, inp = pcall(function() return mk.new() end)
+						if not ok1 then inp = mk.new("") end
+						D.input = inp
+						pcall(function() D.input:setMinimumSize(api.gui.util.Size.new(280, 26)) end)
+						pcall(function() D.input:setMaximumSize(api.gui.util.Size.new(400, 26)) end)
+						pcall(function() D.input:setMaxLength(190) end)
+						local say = api.gui.layout.BoxLayout.new("HORIZONTAL")
+						say:addItem(api.gui.comp.TextView.new("Message"))
+						say:addItem(D.input)
+						D.sayRow = api.gui.comp.Component.new("mpSay")
+						D.sayRow:setLayout(say)
+						D.sayOpenBtn = toggleBtn("  type a message  ", function() CM.chatOpenInput() end)
+						function CM.chatCloseInput()
+							D.chatOpen = false
+							pcall(function() D.input:setText("", false) end)
+							pcall(function() D.input:setEnabled(false) end)
+							pcall(function() D.sayRow:setVisible(false, false) end)
+							pcall(function() D.sayOpenBtn:setVisible(true, false) end)
+						end
+						function CM.chatOpenInput()
+							D.chatOpen = true
+							D.chatIdleText, D.chatIdleSince = "", os.time()
+							pcall(function() D.input:setText("", false) end)
+							pcall(function() D.input:setEnabled(true) end)
+							pcall(function() D.sayOpenBtn:setVisible(false, false) end)
+							pcall(function() D.sayRow:setVisible(true, false) end)
+							pcall(function() D.input:setFocus() end)
+						end
+						D.input:onEnter(function()
+							local t = D.input:getText()
+							if t and #t > 0 then CM.chatSend(t) end
+							CM.chatCloseInput()
+						end)
+						pcall(function() D.input:onCancel(function() CM.chatCloseInput() end) end)
+						pcall(function()
+							D.input:onFocusChange(function(focused)
+								if focused == false and D.chatOpen then
+									local t = ""
+									pcall(function() t = D.input:getText() or "" end)
+									if t == "" then CM.chatCloseInput() end
+								end
+							end)
+						end)
+						chatL:addItem(D.sayOpenBtn)
+						chatL:addItem(D.sayRow)
+						CM.chatCloseInput()
+					end)
+					if not okI then print("[ls-gui] chat input field unavailable: " .. tostring(errI)) end
+					D.chatBox = api.gui.comp.Component.new("mpChat")
+					D.chatBox:setLayout(chatL)
+					box:addItem(D.chatBox)
+					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					local function style(widget, class)
+						if widget then pcall(function() widget:setStyleClassList({ class }) end) end
+					end
+					style(togC, "mpDashTabs")
+					for _, section in ipairs({ D.lobbyBox, D.statsBox, D.chatBox, D.coBox, D.speedBox }) do style(section, "mpDashSection") end
+					style(D.chatText, "mpDashChatLog")
+					style(D.ptable, "mpDashTable"); style(D.table, "mpDashTable")
+					style(D.alertText, "mpDashAlert")
+					style(D.sayOpenBtn, "mpDashPrimary")
+					local footerL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					footerL:addItem(api.gui.comp.TextView.new("Ctrl+Shift+D: show / hide"))
+					footerL:addItem(toggleBtn("Collapse", function() D.setCollapsed(true) end))
+					local footer = api.gui.comp.Component.new("mpDashboardFooter")
+					footer:setLayout(footerL); style(footer, "mpDashFooter"); box:addItem(footer)
+					applyTabs()
+					local body = api.gui.comp.Component.new("mpDashboard")
+					body:setLayout(box)
+					style(body, "mpDashBody")
+					-- Keep both views attached: hidden content cannot retain chat focus,
+					-- and switching views does not destroy the selected tab or callbacks.
+					local compactL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					compactL:addItem(toggleBtn("+ Expand", function() D.setCollapsed(false) end))
+					D.compactNote = api.gui.comp.TextView.new("Session")
+					compactL:addItem(D.compactNote)
+					D.compact = api.gui.comp.Component.new("mpDashboardCompact")
+					D.compact:setLayout(compactL); style(D.compact, "mpDashCompact")
+					local shellL = api.gui.layout.BoxLayout.new("VERTICAL")
+					shellL:addItem(D.compact); shellL:addItem(body)
+					local shell = api.gui.comp.Component.new("mpDashboardShell")
+					shell:setLayout(shellL); style(shell, "mpDashShell")
+					D.body = body
+					function D.setCollapsed(collapsed)
+						CM.dashCollapsed = collapsed == true
+						if CM.dashCollapsed and D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
+						D.body:setVisible(not CM.dashCollapsed, false)
+						D.compact:setVisible(CM.dashCollapsed, false)
+						-- Let the engine size the window from its visible layout; never force 1x1.
+					end
+					D.win = api.gui.comp.Window.new("Multiplayer", shell)
+					D.setCollapsed(CM.dashCollapsed)
+					style(D.win, "mpDashWindow")
+					D.win:setPosition(20, 120)
+					-- The title-bar "x" (2026-09-16): a Window has no close behaviour
+					-- of its own, so the button did nothing. Closing is hiding (the
+					-- window is rebuilt from D on every refresh and must survive),
+					-- and it goes through the same flag as the hide button, or the
+					-- poll below would put it straight back.
+					pcall(function() D.win:addHideOnCloseHandler() end)
+					pcall(function() D.win:onClose(function() D.hideDash() end) end)
+				end
+				-- A column with a fresh local file shows everything. A peer known only
+				-- over the wire shows what we know of it: its game time, our skew to
+				-- it, and our verdict against it.
+				for _, key in ipairs(D.rows) do
+					for _, letter in ipairs(D.cols) do
+						local dd = fresh[letter]
+						local v = dd and dd[key]
+						if not v and peerInfo[letter] then
+							if key == "t" then v = peerInfo[letter].t
+							elseif key == "skew" then v = peerInfo[letter].skew
+							elseif key == "peer" then v = own end
+						end
+						D.cells[key][letter]:setText(v or "-")
+					end
+				end
+				local mine = fresh[own]
+				if D.alertText then
+					local behind = mine and tonumber(mine.actionsoff)
+					local text = behind and string.format("Your game is %.0f game units behind the others: your actions are off until it catches up.", behind) or ""
+					if text ~= D.alertShown then
+						D.alertShown = text
+						if D.compactNote then D.compactNote:setText(text ~= "" and "Catching up - actions paused" or "Session") end
+						pcall(function() D.alertText:setText(text); D.alertText:setVisible(text ~= "", false) end)
+					end
+				end
+				if CM.dashShowLobby and D.lobbyText and CM.lobbyPanelPage then
+					local dir = CM.netDir()
+					local f = dir and io.open(dir .. "/lobby_panel.txt", "r")
+					local body = ""
+					if f then body = f:read(65536) or ""; f:close() end
+					local text, page, pages = CM.lobbyPanelPage(body, CM.lobbyPage)
+					local health = CM.healthWords and CM.healthWords() or nil
+					if health and health ~= "solo" then text = text .. string.char(10) .. "Session health: " .. health end
+					CM.lobbyPage, D.lobbyPages = page, pages
+					D.lobbyText:setText(text)
+					D.lobbyNav:setVisible(pages > 1, false)
+				end
+				local okRecovery, recoveryError = pcall(CM.resyncGuiTick, ownKv)
+				if not okRecovery then print("[ls-gui] resync: " .. tostring(recoveryError)) end
+				-- the verdict and, per peer, our verdict against that peer
+				local vs = {}
+				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
+				table.sort(vs)
+				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-") .. (#vs > 0 and ("   [" .. table.concat(vs, ", ") .. "]") or ""))
+				if CM.statsInWords and D.statusText then
+					local okW, errW = pcall(CM.statsInWords, D.statusText, D.pcells or {}, own, D.cols, fresh, peerInfo)
+					if not okW and not D.statsErrLogged then D.statsErrLogged = true; print("[ls-gui] stats in words: " .. tostring(errW)) end
+				end
+				pcall(function()
+					-- the COMPANIES tab (companies_gui.lua): the sim's company lines -> the widgets
+					if D.coBox then CM.coGuiRefresh(D, mine, guiTick) end
+					if D.chatText and (guiTick % 30) == 0 then
+						local lines = CM.chatTail(8)
+						if #lines > 0 then D.chatText:setText(table.concat(CM.chatWrap(lines), string.char(10))) end
+					end
+					-- an open chat input nobody has typed into for 30 s closes itself
+					if D.chatOpen and CM.chatCloseInput and (guiTick % 30) == 0 then
+						local t = ""
+						pcall(function() t = D.input:getText() or "" end)
+						if t ~= D.chatIdleText then D.chatIdleText, D.chatIdleSince = t, os.time()
+						elseif os.time() - (D.chatIdleSince or 0) > 30 then CM.chatCloseInput() end
+					end
+					-- the speed vote row, with the session speed and the votes it is the mean of
+					if D.speedBox and ((guiTick % 10) == 0 or D.speedShown == nil) then
+						local showRow = CM.dashShowSpeed ~= false
+						if D.speedShown ~= showRow then
+							D.speedShown = showRow
+							D.speedBox:setVisible(showRow, false)
+						end
+						if mine then
+							D.speedEff, D.speedMine = tonumber(mine.eff), tonumber(mine.myvote)
+							if not (D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5) then
+								local sp = (D.speedEff == 0 and "paused") or (D.speedEff and string.format("%gx", D.speedEff)) or "-"
+								if mine.speedreq and mine.speedreq ~= "-" then sp = sp .. " (/speed in the chat)" end
+								local votes = (mine.votes and mine.votes ~= "") and ("   |   votes: " .. mine.votes) or ""
+								D.speedText:setText("session speed: " .. sp .. votes .. "   ")
+							end
+						end
+					end
+				end)
+				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
+				-- one-byte file; no file means shown. Recovery uses its own native
+				-- panel and does not override the dashboard visibility preference.
+				local shown = true
+				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
+				if ff then
+					local v = ff:read("*l"); ff:close()
+					shown = (v ~= "0")
+				end
+				if D.shown ~= shown then
+					D.shown = shown
+					if not shown and D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
+					D.win:setVisible(shown, false)
+				end
+				CM.mpButtonSync(shown)
+			end)
+		end,
+	}
+end

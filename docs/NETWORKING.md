@@ -1,0 +1,579 @@
+# Networking
+
+How players find each other, how game traffic moves between machines, and how the
+shared save gets to everyone. The code is `netpunch/` (Python, frozen into
+`netpunch.exe`), the lobby panel in `native/src/menu_hook.cpp`, and the bridge DLL's
+UDP link in `native/src/net.cpp`. For the threat model see [SECURITY.md](SECURITY.md).
+
+```
+ machine A                                             machine B
+ TransportFever2.exe                                   TransportFever2.exe
+   bridge DLL  --UDP 127.0.0.1-->  netpunch.exe  ==UDP (sealed)==>  netpunch.exe  --UDP 127.0.0.1-->  bridge DLL
+   menu DLL    <--jsonl files-->   (lobby)                          (lobby)        <--jsonl files-->  menu DLL
+```
+
+The game never opens an internet socket itself. Each instance's bridge talks to its
+own lobby process over loopback; the lobbies carry the frames between machines.
+
+## Ports
+
+| what | where | notes |
+|---|---|---|
+| lobby | UDP 29471 on the host | The host's lobby port. It need not be open: the host punches toward each joiner that knocks through the master server (see [Connecting](#connecting)). Joiners bind an ephemeral port. |
+| game relay | UDP `127.0.0.1:7773` (host) / first free of 7774-7805 (joiners) | The bridge sends its frames here; the lobby delivers inbound frames to the bridge's own port. Loopback only. |
+| bridge | UDP `127.0.0.1:7771` (or 7772, or a fallback) | The `port=` line of `tpf2_instance.txt` in the data folder. Bound to loopback, and it drops datagrams that are not from its peer ([SECURITY.md](SECURITY.md#what-is-protected)). |
+| STUN | outbound UDP 19302 / 3478 | `stun.l.google.com`, `stun.nextcloud.com`, `stun.cloudflare.com`, `stun.services.mozilla.com`. |
+| master server | outbound HTTPS | The public game list, and the rendezvous for hole punching (`/knock`); see [Master server](#master-server). |
+| dedicated relay | UDP 29471 on the server | Same protocol as a host. |
+| save transfers | TCP 29471 on the host or relay | The bulk channel the save and mod transfers stream over ([Save transfer](#save-transfer)). A host maps it with UPnP beside the UDP port; when it is not reachable the transfer uses the UDP path. The relay opens it in ufw. |
+
+## Join codes
+
+A code is base32 (RFC 4648, padding stripped) of a small binary profile
+(`connect.py`):
+
+| bytes | content |
+|---|---|
+| 1 | flags: `0x01` open NAT, `0x02` symmetric, `0x04` CGNAT, `0x08` LAN address present, `0x10` public address present, `0x20` IPv6 present, `0x40` IPv6 is 6to4, `0x80` session secret present |
+| 4 | Unix timestamp |
+| 6 | LAN IPv4 + port (if flagged) |
+| 6 | public IPv4 + port (if flagged) |
+| 12 or 18 | IPv6 port + address, 10 bytes when 6to4 (if flagged) |
+| 12 | session secret (if flagged) |
+
+A typical host code is 47 characters. With a lobby password the code is **locked**:
+`0xFF | timestamp | ciphertext | tag`, where the key is PBKDF2-HMAC-SHA256 over the
+password (600,000 iterations, salted with the timestamp). A locked code reveals nothing
+but its age; a wrong or missing password fails at decode time. A locked host code is
+about 74 characters.
+
+- A normal host gets a new secret, so a new code, on every launch.
+- A dedicated relay keeps its secret in `relay_secret.bin`, so its code stays valid
+  across restarts.
+- Codes older than 10 minutes produce a warning, not a failure.
+- The IPv6 part is carried but unused: the lobby connects over IPv4 only.
+
+## Connecting
+
+Every join request, welcome and roster carries the release version, and admission needs an
+exact match on both sides; [version-checking.md](version-checking.md) has the rule and its tests.
+
+**Host.** `netpunch.exe host` observes its own socket (STUN, plus a UPnP port mapping
+it removes on exit), prints `CODE=...`, answers every HELLO, and polls the master server
+for knocks every second. For each knock it can open, it sends HELLO to that joiner's
+public and LAN addresses every 0.2 s for 15 s. Those packets open the host's own NAT for
+the joiner's HELLOs, so the host does not need UPnP or a forwarded port. A host still
+has to be reachable directly when the master is unreachable, or when both ends sit
+behind symmetric NAT or CGNAT. A dedicated relay does not poll: its port is open.
+
+**Joiner.** `netpunch.exe join <code>` decodes the code, observes its own socket (no
+UPnP), and sends HELLO every 100 ms to the host's candidates, VPN adapter first when the host has one (Hamachi 25.0.0.0/8 or Tailscale 100.64.0.0/10, or `TPF2MP_VPN_IP`; carried as a trailing field of the code, so two players on one virtual LAN connect without any NAT), then LAN, until an ACK
+echoes its token or 40 s pass. Punching is the fallback: a host whose port is open (UPnP,
+a forward) answers within a second and nothing else happens. If there is no answer after
+4 s, the joiner **knocks**: every 2 s it posts its own
+profile code to the master server's `/knock`, sealed with a key derived from the code's
+secret (and password), under a tag also derived from the secret
+(`SHA-256("tpf2mp-rendezvous-v1|" + secret)`, 24 hex characters). The master can
+neither read a knock nor tell which lobby a tag belongs to, and keeps knocks for 60 s.
+If the joiner's public address equals the host's, only the LAN candidate is used (no
+NAT hairpin). There is no port prediction. `--rendezvous <url>`
+picks the master used for knocks (default: `--publish`, else the project's);
+`--rendezvous off` disables them.
+
+**Relay fallback.** A host behind CGNAT cannot be punched and a joiner behind a
+symmetric NAT cannot be punched toward, so that pair had no path at all. From its second
+knock on, a joiner still unanswered adds `relay: 1` and a nonce to the knock; the master
+binds one UDP port of its `--relay-ports` range for that joiner and returns
+`{"relay": {"ip", "port", "id"}}`, and hands the same allocation to the host with
+the note. Each end sends a bind packet (`TRLB` + the 16-byte id + `J` or `H`) to that
+port from its game socket; from then on the port swaps every datagram between the two
+addresses it learned, verbatim. The joiner adds the port to its dial as one more
+candidate, so a direct path that answers first still wins; the host binds every
+200 ms until the joiner's frames arrive through the port. The frames stay sealed with
+the session key: the master forwards bytes it cannot read, and a port dies after 90 s
+without traffic. Save transfers to a relayed joiner take the UDP path (the TCP side
+channel dials the host directly and fails). A master started without `--relay-ip`
+offers no relay and the punch stays the only fallback; a host or joiner from before
+this ignores the field. Tested in `tools/rendezvous_test.py` (sections 5 and 6).
+
+**Joiner to joiner (mesh).** Every joiner puts its own profile code in its `join`, the
+host shares all profiles in the roster, and joiners dial each other on their single
+socket (HELLO every 100 ms for up to 8 s, retried every 30 s; a silent link dies after
+30 s). A pair that cannot connect directly exchanges frames in an envelope through the
+host, or, if the host has been silent for 12 s, through any peer that has a direct link.
+`--no-mesh` gives the old star (everything through the host).
+
+## Game frames
+
+- The bridge DLL sends each lockstep frame as one UDP datagram to its lobby's game relay
+  port. The lobby wraps it in a `g` payload and sends it on; the receiving lobby delivers
+  it to its bridge's port. Frames over 1,400 bytes are dropped.
+- **A normal host** sends local frames to every joiner, delivers joiners' frames to its
+  bridge, and forwards envelopes addressed to other players.
+- **A mesh joiner** sends to the game host directly, to directly linked peers directly,
+  and to everyone else in an envelope (`r` + destination + source + frame).
+- **A relay** has no bridge: it only forwards envelopes by name (and, for old star
+  clients, fans their frames out).
+- The lobby layer does not retransmit game frames. Reliability lives above it: the
+  bridge's `net.cpp` link and the Lua layer's per-origin sequence numbers with NACK and
+  resend (see [ARCHITECTURE.md](ARCHITECTURE.md#reliability)).
+
+The bridge link's packets: a 57-byte header (magic `FPT5`, the world epoch, a per-process session
+id, the session an acknowledgement is for, sequence number, acknowledgement and a 32-bit
+acknowledgement bitmap, type 0 keepalive or 1 event) and, for events, a 5-byte chunk header (type,
+chunk index, chunk count) followed by the chunk's text and its terminating NUL, at most 1,024 bytes.
+A keepalive is 57 bytes and an event 63 to 1,086 bytes, only as long as its text (protocol 5; every
+event used to be a full 1,086 bytes), well under the lobby's 1,400-byte frame limit. A receiver
+drops an event whose text does not end inside the datagram. Unacknowledged packets are resent
+every 250 ms; with more than 512 pending the backlog is dropped; a peer is considered gone after
+10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
+other directly.
+
+## TCP reachability and transfer display
+
+The save-transfer listener accepts IPv4 and IPv6 on the same port. IPv6 failure
+leaves IPv4 available and is logged. At least one participant must be reachable:
+IPv4 usually needs a TCP router mapping (normally UPnP); IPv6 still needs inbound
+firewall permission. A successful UDP mapping does not prove TCP reachability.
+Host TCP mappings are attempted independently of UDP and their result is logged.
+When both participants dial simultaneously, the receiver follows the stream on
+which the sender actually supplies data, avoiding opposite connection choices.
+
+Lobby and resync panels show the transfer route, TCP status, received/total MB
+and current MB/s. Progress updates about once per second. Sender figures count
+receiver-confirmed bytes; receiver figures count unique bytes. Queued bytes and
+retransmissions are not counted as useful throughput. `TCP failed` or
+`TCP unavailable` means Steam/UDP is carrying the transfer; it does not identify
+which router or firewall blocked the connection.
+
+The normal host uses **TCP 29471**. A joiner's local port is selected dynamically;
+`--local-port` or the dedicated-server port setting can change the host port.
+When TCP fails, the lobby chat and resync panel name the actual advertised host
+port to check in the router/firewall. For IPv4, forward that TCP port to the host
+PC if automatic mapping is unavailable. No manual mapping is required when a
+direct path already works; opening both participants' ports is not necessary.
+
+Regression checks: `python tools/test_tcp_connectivity.py`,
+`python tools/test_transfer_status.py` and `python tools/test_steam_tcp.py`.
+These are local socket/simulation tests, not proof of Internet reachability.
+
+## TCP backup link
+
+Since 2026-09-17 (`netpunch/dual_tcp.py`) every sealed frame between a joiner and the host --
+control messages and game frames alike, never save chunks -- goes out twice: on the punched UDP
+socket as before, and on a TCP connection between the two. The joiner connects to the host's
+(or relay's) lobby port over TCP once its UDP punch has landed, and both sides also try a TCP
+simultaneous open toward the address the other punched from, bound to their own lobby port,
+for a NAT that preserves ports; whichever lands first is the link (`[dual] TCP link with ... up
+(joiner connected | host connected)`). A frame read from the link is written into the process's
+own UDP socket over loopback with the original sender's address in front, so every consumer sees
+it as an ordinary datagram from the peer, and the seal layer's per-sender replay window drops
+whichever copy comes second. Nothing above the socket changed.
+The joiner's hello carries the name it ASKED for (it dials before the host has named it);
+the host matches the assigned name, then the asked one, telling joiners that asked for the
+same name apart by the connection's address. Matching the assigned name alone closed every
+link of a renamed joiner (`ComradeSilver#2`: two instances on one Steam account, 2026-09-22).
+`tools/test_dual_link_names.py`.
+
+What it is for is written in the log every 10 s per peer: `[dual] bob: udp_first=.. tcp_first=..
+tcp_only=.. (udp lost, tcp covered) udp_only=.. (tcp lost/late); tcp later by p50/p90/max, udp
+later by p50/p90/max`. `tcp_only` is a UDP datagram that never arrived but whose TCP copy did;
+`udp_only` a TCP copy that never came within 3 s. The bridge's own ARQ still recovers what both
+paths lose. `python lobby.py --selftest-dual` runs a joiner losing 30% of its UDP sends: every
+frame still reaches the host with the link, 70% without it. Off with `tpf2mp_tcp_backup.txt`
+containing `0` in the lobby's folder (`<game folder>
+etpunch\`); off in an unsealed session (no nonce to dedup on).
+
+**Impairing one instance** (`netpunch/netsim.py`): `tpf2mp_netsim.txt` in the lobby's own folder
+(`<game folder>
+etpunch\`, where `lobby_state.json` lives; a box has its own copy under its overlay), `loss=0.05`, `delay=0.100`, `jitter=0.010`, drops that fraction of the datagrams the
+instance sends and delays the rest (the TCP link's frames wait the same, but are never dropped:
+TCP's loss is the OS's). Read once at the lobby's start; the log says `[netsim] impairing what
+this instance sends: ...`. Outbound only, so a two-sided setup is two files.
+
+## Lobby protocol
+
+Every packet is `NP1:` + a one-byte type + payload; anything else is ignored.
+
+| type | meaning |
+|---|---|
+| `H` / `A` / `C` | HELLO (8-byte token) / ACK (echoes it) / CONNECTED |
+| `K` | keepalive, every 15 s on punched links |
+| `E` | sealed data (the normal case) |
+| `D` | plaintext data: accepted only for save chunks, in an unsealed session, or (by a joiner that is not yet meshed) a "wrong password" reject |
+| `S` | signed-only data (defined, not sent) |
+
+A data payload starting with `{` is a JSON lobby message, `NPF1` a save chunk, `g` a
+game frame, `r` a relay envelope.
+
+| `t` | direction | fields |
+|---|---|---|
+| `join` | joiner → host | `name`, `mesh`, `profile`; re-sent every 3 s until the joiner knows the host's name |
+| `welcome` | host → joiner | `you`, `host`, `lobby`, `relay` |
+| `roster` | host → each joiner, on change and every 2 s | `players`, `host`, `lobby`, `relay`, `letters` (relay only), `started` (for that peer), `start_save`, `stored_age`, `stored_max`, `profiles`, `links`, `companies` |
+| `chat` | both | joiner sends `text`; host stamps `from`, `ts`, `cid` and sends three copies |
+| `ping` | joiner → host, every 3 s | |
+| `company` | joiner → host | `player`, `id` (1-200); a joiner may set only its own, a relay lobby's leader anyone's |
+| `links` | joiner → host, when changed | `direct`: names it has a direct link to |
+| `mesh_hi` | joiner ↔ joiner | `name` |
+| `log` | joiner → host | forwarded log lines for the host's merged `lobby_peers.log` |
+| `start` | host → players (three copies); leader → relay | `save` |
+| `status` | host → one joiner | `state`, `detail` |
+| `leave` / `bye` | joiner → host / host → all | |
+| `reject` | host → joiner | `reason`: `lobby full`, or `wrong password` (sent plaintext) |
+| `fbegin`, `fbegin_ack`, `fack`, `fdone` | save transfer | see [Save transfer](#save-transfer) |
+
+Timers: a host drops a peer after 10 s of silence; a joiner declares the host gone
+after 12 s. Duplicate names become `name#2`, `name#3`. The lobby accepts up to 200
+players including the host; the roster (with every profile and mesh link) travels as one
+datagram, so a fully meshed lobby runs out of datagram size well before that, somewhere
+around 45-60 joiners.
+
+**Letters.** Each player's instance letter (`a`, `b`, ...; after `z`: `aa`, `ab`, ...)
+namespaces its commands. In a normal lobby the host is `a` and the others get `b`, `c`,
+... in name order, derived by the menu DLL from the roster. A relay assigns letters itself
+(lowest unused), saves them in `relay_letters.json` and keeps them per name forever, so a
+returning player gets the same letter.
+
+## The lobby and the game
+
+The menu DLL starts the lobby when the player presses HOST GAME or JOIN GAME:
+
+```
+host --name <player> --game-relay-port 7773 --game-local-port <bridge port> --forward-log <file> x4
+     [--password <pw>] --lobby-name "<name>" [--publish <master url> [--public]]
+join <code> --name <player> --local-port 0 --game-relay-port <7774+> --game-local-port <bridge port>
+     --forward-log <file> x4 [--password <pw>]
+```
+
+It runs the lobby from `%LOCALAPPDATA%\tpf2mp\netpunch\` when that folder holds
+`netpunch.exe` or `lobby.py`, otherwise from `netpunch\` next to `tpf2_menu.dll` (the game
+folder), preferring `netpunch.exe` to `python lobby.py`. That folder is the lobby's working directory and holds the
+IPC files. stdout and stderr go to `lobby_proc.log` there; the process runs in a job
+object so closing the game kills it. Inputs are sanitised before they become arguments:
+the code must be base32, names are restricted to letters, digits and `-_.` (lobby names
+also allow spaces and `'`), and the logged command line masks the password.
+
+| file | written by | content |
+|---|---|---|
+| `lobby_out.jsonl` | lobby (truncated at start) | events, one JSON object per line |
+| `lobby_in.jsonl` | menu DLL and the Lua mod (truncated by the lobby at start) | commands, one JSON object per line |
+| `lobby_state.json` | lobby | a merged snapshot (`state`, `players`, `you`, `host`, `started`, `code` on a host) |
+| `lobby_peers.log` | host or relay | every player's forwarded log lines, merged |
+| `incoming_save.sav` / `.sav.lua` / `.jpg` | receiver | the shared save, written only after its hashes verify |
+| `lobby_proc.log` | menu DLL | the lobby process's stdout and stderr |
+
+Events (`lobby_out.jsonl`): `code`; `status` (`state` waiting/connected/failed and a
+human-readable `detail`, which the panel shows); `roster` (`players`, `you`, `host`,
+`lobby`, `relay`, `companies`, and on joiners `letters`, `stored_age`, `stored_max`);
+`chat` (`from`, `text`, `ts`); `start` (`save`); `transfer` (`role` send/recv, `pct`,
+`state`, `peer`); `save_ready` (`name`, `dir`, `files`).
+
+Commands (`lobby_in.jsonl`): `chat` (`text`); `company` (`player`, `id`);
+`publish` (`on`); `start` (optional `save` = path of the save to share); `quit`; `name`
+(accepted, never sent).
+
+Chat lines starting with `/` are conventions of the game side, not the lobby, except `/new`,
+which a relay interprets (below). The panel treats a chat line starting with `!hotjoin ` as a
+status message.
+
+## Save transfer
+
+1. The host presses START GAME. The menu sends `start` with the newest `*.sav` in the
+   save folder (skipping `mp_shared.sav` unless it is the only one); with no save at all it
+   sends a plain `start`.
+2. The lobby reads the `.sav`, its `.sav.lua` and `.jpg` sidecars, and sends them as one
+   stream named `incoming_save.sav`, `incoming_save.sav.lua`, `incoming_save.jpg`, with a
+   SHA-256 per file and overall in the (sealed) `fbegin`.
+3. **Over TCP when it can** (2026-09-17, `netpunch/bulk_tcp.py`). The host and the relay
+   listen on the lobby port over TCP as well. `fbegin` carries the listener's port and a
+   16-byte token; each receiver connects, says `TPF2BULK1 recv <sid> <token> <name>`, and
+   the file streams down that connection from offset 0, in order, nothing else. A leader
+   uploading to the relay does the same the other way round: the relay's `fbegin_ack`
+   names its port and the leader connects with role `send`. The side behind NAT always
+   connects, so no TCP hole punching is attempted; a host not reachable on TCP (no UPnP
+   TCP mapping, a firewall) costs the joiner one failed connect and the transfer runs over
+   UDP as below. A stream that breaks half way leaves the receiver's feedback naming the
+   holes and the UDP path fills them. Measured on loopback: ~10 MB/s per peer over the UDP
+   scheme, ~450 MB/s over TCP; over the internet TCP reaches the link's speed, which the
+   2.76 MB UDP window (window / round trip: ~15 MB/s at 185 ms) does not. `BULK_TCP` in
+   lobby.py turns it off for a diagnosis. A Windows host gets the firewall's one-time
+   prompt for `netpunch.exe` the first time it listens; refusing it only means joiners use
+   the UDP path.
+4. Over UDP otherwise: chunks are 1,350 bytes (8,192 when every receiver is on loopback),
+   sent as plaintext `NPF1` frames inside a 2,048-chunk window (16,384 on loopback).
+   Receivers write each chunk at its offset, report `{base, nack}` every 50 ms, and the
+   sender resends NACKed chunks first. It rewinds after 0.5 s without feedback and gives up
+   on a peer after 30 s without progress. The feedback runs on this path during a TCP
+   stream too, so progress, stages and timeouts are one mechanism.
+4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
+   writes past the end, verifies every hash (retrying the whole transfer up to three
+   times), writes the files and emits `save_ready`.
+5. **Required mods.** The host advertises the selected save's mod list in the
+   welcome/roster and rechecks it when sending a save. Joiners compare it with
+   their engine catalogue. Download Mods approves the missing items; Cancel
+   leaves the lobby. The saved Auto-accept checkbox answers future prompts.
+   Mods may download before the initial save, or in a second round after it.
+   Hotjoins use the same protocol and current save list.
+   **The Workshop first (2026-09-22).** A joiner whose Steam tunnel is up subscribes
+   to the approved Workshop items through Steam instead of asking the host for them:
+   `UGC SUB <id>...` on the tunnel's control port (SubscribeItem + DownloadItem at high
+   priority), then `UGC STATE <id>...` once a second (EItemState flags, bytes, install
+   folder). An installed item is registered like a folder already on disk. The host's
+   round is asked only for local mods and for items Steam did not subscribe to within
+   20 s (hidden, removed, offline) or whose download made no progress for 120 s. A
+   bridge without the commands, no tunnel, the relay and the rig's
+   `ignore_steam_workshop` flag skip Steam. A save round that arrives first ends the
+   Steam phase and the host sends the remainder. `tools/test_workshop_subscribe.py`.
+   Workshop files the host sends go into the multiplayer data folder's `workshop/<id>` directory.
+   Local mods use the game's local mod folders. Existing installations are not
+   overwritten. Archive paths and unpacked sizes are checked. A fresh registry
+   token and native catalogue receipt gate the final acknowledgement: a disk
+   copy alone is not ready. Failures leave the lobby rather than loading without
+   the mod. The installer provides the native Workshop registrar.
+   A dedicated relay caches mod archives uploaded by its leader and supplies them
+   to later joiners; it never executes them. Deluxe and Early Supporter DLC are
+   advertised as requirements but never packaged, cached, or installed through
+   this protocol. Per-save mod settings remain in the save.
+6. When every receiver has verified (and any mods round has resolved), the host sends `start` to them. On each joiner the menu
+   DLL copies the files into the game's save folder as `mp_shared.sav` (+ sidecars) and the
+   player loads **mp_shared** from LOAD GAME. A failed transfer leaves the host with
+   "press START GAME to retry".
+
+A player who joins while a transfer is running is served as soon as it finishes; one who
+joins after the start is sent the last shared save.
+
+## Hot join
+
+A player who arrives while a game is running needs the world as it is now. The host's
+menu DLL takes care of it: when the roster grows in game (or someone types `/sync`), it
+forces the game's own autosave (see [re/GAME_LOOP_AND_UI.md](re/GAME_LOOP_AND_UI.md)),
+waits for the file to stop growing, and sends it to the lobby as a normal `start` with a
+save. Players already in the game ignore the start; the newcomer loads it. The Lua side
+brings the newcomer's clock up to the session with command history and a catch-up speed
+(see [ARCHITECTURE.md](ARCHITECTURE.md)).
+
+## Dedicated relay
+
+`lobby.py host --relay-only` runs a lobby with no game, for groups where nobody can
+accept inbound connections, and for an always-on public server.
+
+- **Leader.** The oldest connected joiner is the leader: it gets the host role in the panel
+  and is the session's clock. When it leaves, the next-oldest takes over.
+- **Stored world.** The relay keeps the last save a leader uploaded
+  (`incoming_save.*` in its data folder), replaced only when a new upload verifies.
+- **Resuming.** When a leader joins a relay that holds a world and no session is running,
+  the relay pushes the stored world to everyone and starts them, after 3 s so that players
+  arriving together share one transfer. With no stored world, the leader is told to press
+  START GAME, which uploads the leader's most recent save (below). Until the stored world is
+  sent, the leader can say `/new` in chat to discard it and share their own save with START
+  GAME instead. To replace the stored world from outside the game, see `tools/relay_put_save.sh`.
+- **Uploads.** The leader's START GAME uploads its save to the relay, which then shares it
+  with everyone waiting. While a leader plays, its menu DLL re-uploads a fresh autosave every
+  2 minutes (`relay_autosave_min` in `tpf2_menu_flags.txt`; 0 turns it off); when nobody is
+  waiting for it the relay just keeps the copy.
+- **Late joiners** are served the stored world if it is at most 180 s old, or if it is the
+  copy the running session resumed from (until a newer upload replaces it); otherwise they
+  wait for the leader's next save.
+- **Persistence.** Letters (`relay_letters.json`), company chips (`relay_companies.json`) and
+  the secret survive restarts. When the last player leaves, the session is closed but the
+  world is kept.
+- **It does not simulate.** The world only advances while players are connected.
+
+Operating one (all scripts take the SSH target as their first argument):
+
+| script | does |
+|---|---|
+| `tools/relay_deploy.sh [target] [lobby name] [udp port]` | copies the netpunch sources to `/opt/tpf2mp/netpunch`, writes `/etc/tpf2mp/relay.env` and the `tpf2mp-relay` systemd unit (runs as user `tpf2mp`, data in `/var/lib/tpf2mp/relay`), opens the port in ufw, restarts, and prints the public listing. Refuses to restart while players are connected unless `FORCE=1`. |
+| `tools/relay_put_save.sh <save.sav> [target]` | replaces the relay's stored world with a local save (does not restart the service). |
+| `python tools/relay_selftest.py` | runs a real relay and players locally: letters, upload, mid-session joins, restart with the same code, frames both ways. Needs internet for STUN. |
+
+## Master server
+
+`netpunch/masterserver.py` is a stdlib HTTP service that only lists games; the code in a
+row is the join, nothing is brokered. It runs as the `tpf2mp-master` systemd unit on
+`127.0.0.1:8471` behind nginx, which serves it at `https://srv1306562.hstgr.cloud/tpf2mp/` (the
+VPS's own hostname, with its own Let's Encrypt certificate); `tools/masterserver_deploy.sh`
+installs all of it. A relay deployed by `tools/relay_deploy.sh` announces to `127.0.0.1:8471`
+directly.
+
+| endpoint | behaviour |
+|---|---|
+| `GET /list` (or `/`) | `{"servers": [{id, name, code, players, max, game, type, version, locked, age}], "now", "ttl": 30}`, newest first |
+| `POST /announce` | body `{id, name, code, players, max, type, version, locked}` (at most 4 KB; `code` required); at most 500 entries |
+| `POST /leave` | body `{id}` |
+| `GET /health` | `ok` |
+
+`type` is `relay` or `host`, shown in the panel as "dedicated server" or "player hosted"; the
+list never carries a save name. The master also writes that label into `game`, the column that
+panels from 0.4.11 and earlier display. An announce without a valid `type` (a lobby from before
+the field) counts as `relay` when its `game` is `dedicated relay`, and as `host` otherwise.
+
+Entries expire 30 s after their last announce and live only in memory. A host with PUBLIC
+ticked (or a relay started with `--public`) announces every 10 s and sends `/leave` when
+unticked or closed (a relay also on SIGTERM, so stopping its service removes the row); a
+host killed hard simply ages out. A relay announces under a stable id derived from its lobby
+name, port and machine, so a restarted relay replaces its own row. The panel fetches `/list`
+every 10 s while the HOST/JOIN page is open. `master_url=` in `tpf2_menu_flags.txt` points the panel
+and hosts at another server; an empty value hides the list and disables publishing.
+
+## Self-tests
+
+```
+cd netpunch
+python lobby.py --selftest            # host + 2 joiners + a late joiner: roster, chat
+python lobby.py --selftest-transfer   # save transfer, clean and with 8% / 15% loss, plus a retry
+python lobby.py --selftest-relay      # game frames through the relay, both directions
+python lobby.py --selftest-mesh       # host + 3 sealed joiners, every frame arrives once
+python seal.py                        # sealing: round trip, tamper, replay, reorder
+python mesh.py                        # three mesh nodes
+python connect.py selftest            # code format and a loopback connect race
+python ..\tools\relay_selftest.py     # real processes, dedicated relay (needs internet)
+```
+
+`punch.py`, `connect.py` and `observe.py` also run standalone (a two-player punch test, the
+original two-player connect CLI, and a printout of this machine's connectivity profile).
+
+## Steam's networking
+
+Since 0.6.1.15 the bridge DLL also carries the lobby's traffic over Steam's own
+P2P networking (`native/src/steam_tunnel.cpp`, the game's `steam_api64.dll`,
+`ISteamNetworking`). Steam does the NAT traversal and, when no direct path
+opens, relays through Valve's servers, for any app: nobody forwards a port,
+installs a VPN or depends on the master server's relay.
+
+- **How it appears to the lobby.** The tunnel presents every Steam peer as a
+  loopback UDP endpoint: `127.0.0.1` on a port in 62100-62199, the range that
+  tells an endpoint from a real peer. A datagram the lobby sends there goes
+  out as a P2P packet to that SteamID; a packet from that SteamID arrives at
+  the lobby's socket from that endpoint. Sealing, the roster, the save
+  transfer and the NACK/resend are unchanged; the TCP side channels (the
+  backup link, the bulk channel) are skipped for endpoints, so a transfer
+  through Steam runs on the UDP path. Packets over 1,200 bytes go through
+  Steam's reliable send (the unreliable limit), the rest unreliable.
+- **Addressing.** The host's SteamID rides in the join code as the last
+  trailing field; the joiner dials it through its tunnel as one more
+  candidate, in the same race as the LAN, public and VPN addresses (a direct
+  path still wins when it answers first). The joiner's knock at the master
+  carries its own SteamID, so the host opens the session from its side too;
+  a session request Steam delivers is accepted from anyone, the seal decides.
+- **Files.** `tpf2_steam.txt` in the data folder (`id=`, `port=`, `name=`)
+  once the tunnel is up; `tpf2mp_steam_off.txt` keeps it off. The tunnel's
+  lines in `tpf2_bridge.log` start with `[steam]`; `STATUS` on its control
+  port lists every endpoint with Steam's session state (relay in use, errors).
+- **The Steam ID as the join code (2026-09-22).** A host whose tunnel is up
+  shares its SteamID64 as the code, and the lobby is Steam-only: a HELLO
+  that does not come from a tunnel endpoint is not answered (it is logged
+  once every few seconds). A Steam ID is public, so it cannot carry the
+  session secret the classic code does. The joiner gets the secret over the
+  tunnel instead, in a Diffie-Hellman exchange (`steamkey.py`, packet type
+  `X`, RFC 3526 group 14) that the host answers only from tunnel endpoints.
+  The frame key is still `derive_key(secret, password)`, so a lobby password
+  works as before. `connect.steam_code_id` accepts 17 digits in the
+  individual-account range or a pasted `steamcommunity.com/profiles/` URL.
+  **CROSS-PLAY** (`--crossplay` at start, or `{"cmd":"crossplay","on":...}`
+  live) opens the gate and switches the shown and published code to the
+  classic one; the `code` event carries `code`, `steam`, `crossplay` and
+  `cross_code`. A host without a tunnel, a relay-only host and a dedicated
+  server always use the classic code. `tools/test_steam_code.py` covers it.
+- **Saves take TCP first (2026-09-22).** A Steam peer is a loopback endpoint, so
+  over the sealed link each end names its own addresses (`MY_TCP_ADDRS`, from its
+  NAT observation): the host in `fbegin` (`tcp.addrs`), the joiner in `fbegin_ack`
+  (`tcp_addrs`, `tcp_port` of a listener it opens, `tcp_pull` when it dials). The
+  joiner dials the host, the host dials the joiner, and the first stream carries
+  the file. Steam's chunk pump holds meanwhile and starts only when neither
+  connects within `TCP_FIRST_WAIT` (15 s) or both ends have given up (`tcp_gave_up`);
+  a broken stream hands the rest to Steam. `tools/test_steam_tcp.py`.
+  A joiner in through Steam opens that listener at once and maps its TCP port by
+  UPnP, offering the router's WAN IP first (before, it offered only LAN, VPN and
+  6to4 addresses, so a host on another network could never dial it); the mapping
+  is removed when the lobby exits. A failed dial now says why in the log:
+  `timed out (blocked: firewall or no port mapping)` or `refused (nothing listening)`.
+- **Not there:** a dedicated server whose Steam client runs offline (the VPS),
+  a game started outside Steam, and a second instance on the same account
+  (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
+
+### Diagnosing reliable Steam save transfers
+
+The optional 32 KB Steam path starts with 16 chunks in flight and grows on
+acknowledged delivery, up to 128 chunks. Missing-chunk reports alone do not
+requeue that window: Steam already guarantees delivery of messages it accepts.
+After three seconds without contiguous progress, the sender probes the first
+missing chunk. If the receiver reports later chunks already present, up to eight
+holes are repaired together. Repeated stalls back off to eight seconds. A stall
+without evidence of later delivery also reduces the window. Local UDP loss and
+refused Steam sends remain recoverable; the existing no-progress timeout remains.
+
+The 0.6.1.25 experimental release enables the large-chunk path for Steam-only
+transfers so it can be tested without a local flag file. Mixed Steam/CROSS-PLAY
+transfers keep MTU-safe chunks. A reachable direct TCP stream remains preferred.
+
+During large-chunk transfers, `[xfer]` lines in the lobby log report acknowledged
+bytes, unique received bytes, application throughput, in-flight bytes, recovery
+probes and duplicate chunks every five seconds. `[steam-bulk]` lines in the bridge
+log report the endpoint's cumulative bytes, Steam's queued bytes/packets, refused
+sends and local forwarding errors. Its `tx` rate is bytes accepted by the Steam
+API, not confirmed remote delivery; compare it with receiver `[xfer]` progress.
+These lines also cover the default plaintext small save chunks. Endpoint numbers
+identify local sockets without logging session secrets.
+
+Run `python tools/test_steam_backpressure.py` for a deterministic finite-queue,
+rate-limited transport test using the production sender and receiver. It covers
+256 KiB/s, 1 MiB/s and 16 MiB/s links, dropped local datagrams, missing feedback,
+rewind and no-progress timeout. File hashes must match. This simulation does not
+replace a two-computer Steam test. The existing `test_steam_chunks.py` additionally
+checks two receivers with 0%, 8% and 15% injected datagram loss;
+`test_steam_tcp.py` checks both TCP dialing directions and the Steam fallback.
+
+## Experimental Steam transport comparison (0.6.1.26)
+
+The default tunnel uses SteamNetworkingMessages v002 through the game's own
+steam_api64.dll. Vendored Valve headers provide the ABI; no additional Steam
+initialization or networking library is introduced. Both participants must use
+this version and the same mode. A missing Messages API is an explicit failure,
+not an automatic legacy fallback.
+
+For an A/B comparison, close the game on both computers and create
+`%LOCALAPPDATA%/tpf2mp/data/tpf2mp_steam_legacy.txt` on each. Start through the
+launcher and check `transport=Legacy`; remove the file with the game closed to
+return to `transport=Messages`. This startup switch persists across updates.
+Direct TCP still takes priority, so compare only runs whose save uses Steam.
+
+`[steam-messages]` reports Steam's estimated send capacity, recent wire rates,
+ping, pending bytes and sent-but-unacknowledged reliable bytes. These are distinct
+from `[steam-bulk]` tx (bytes accepted by the API) and `[xfer]` acknowledged save
+bytes. Modern packet queue count is unavailable and reported as -1. Mode changes
+require restart; mixed-mode peers cannot communicate.
+
+The measured 0.6.1.25 live run sustained about 0.54 MB/s with zero application
+retries or receiver duplicates. The new API is a test candidate, not a confirmed
+speed fix. Run `python tools/steam_messages_test.py` for the adapter boundary
+regression, and the existing transfer tests for save protocol coverage.
+
+### Local Messages rate candidate on 0.6.1.26
+
+The actual 0.6.1.26 session reported capacity=1048576B/s, ~1.01 MB/s unique
+save bytes and ~4 MB pending, without application retries or duplicates. The
+Valve header comment at SendRateMin/SendRateMax instructs equal values for a
+manually configured rate. SNP_ClampSendRate in the matching Valve source forces
+the rate estimate to that value when the clamps match. Both clamps now use
+16 MiB/s; a high maximum alone did not cause the observed connection to grow
+above its 1 MiB/s minimum. This is a fixed configured rate, not an adaptive
+bandwidth estimate or a promise of measured internet throughput. Diagnostics
+also include local/remote connection quality. Live verification is still needed.
+
+### Adaptive Messages rate (0.6.1.28)
+
+The 16 MiB/s fixed-rate experiment produced high wire traffic but poor remote
+in-order packet delivery and very little unique save progress. Messages now
+starts with equal 1 MiB/s clamps and samples active outgoing peers every five
+seconds. Remote delivery quality below 0.90 halves the rate (floor 256 KiB/s).
+Three samples with quality at least 0.98 and a send backlog permit 25% growth.
+Unknown quality, idle connections and receive-only traffic cannot increase it.
+After congestion the session ceiling is reduced to 75% of the failed rate;
+this prevents repeated aggressive probing of the same bottleneck. Worst peer
+feedback governs the process-wide inherited Steam settings. Both clamps are
+changed together; failed setters attempt to restore the previous pair and log
+failure. Actual reported capacity and unique transfer progress remain the live
+verification, not the configured target. The controller resets on game restart.
+Legacy transport retains its previous fixed configuration.

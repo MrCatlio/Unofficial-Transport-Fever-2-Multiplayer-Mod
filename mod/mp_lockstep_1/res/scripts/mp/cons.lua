@@ -1,0 +1,1905 @@
+-- mp/cons.lua -- constructions: hybrid replication, station edits, edge demolish, capture polls
+--
+-- Split out of lockstep.lua on 2026-09-08. Loaded from the game script as
+--     require("mp.cons")(CM, K, log)
+-- A FACTORY so each load of the game script gets fresh file-scope state.
+-- Symbols shared between modules live in CM (CM.<name>); K is the constants
+-- table, log the instance-tagged logger. Body kept at column 0 on purpose:
+-- tools/luacheck.py's use-before-define checks look at column-0 declarations.
+return function(CM, K, log)
+-- ---------- constructions: HYBRID replication ----------
+--
+-- Stations and depots cannot go through the strict capture-cancel-replay path
+-- that roads use. Measured today: a script-built construction proposal is
+-- rejected by make_cmd::BuildProposal itself (error `false`, hook never fires),
+-- and the params.modules map is a native map<int, ModuleInfo> that is not in
+-- the proposal bytes at all. So for constructions:
+--
+--   1. the ORIGINATOR lets the build happen locally (the hook does not cancel
+--      caller 419f62), then reads fileName / params / transf back off the
+--      resulting entity and schedules a CONP command carrying all three;
+--   2. every peer replays it at the stamp with game.interface.buildConstruction
+--      + setPlayer -- the path mp_bridge measured live, including a 16-module
+--      modular station -- and the originator skips its own command.
+--
+-- Cost: the originator applies at T0 and peers at T (~0.7s later), so this is
+-- not strict lockstep for constructions. Entity ids may differ across peers as
+-- a result, which is consistent with the rest of the design: nothing addresses
+-- a construction by id on the wire.
+-- No depth cap. Until 2026-09-16 every table below depth 8 was SILENTLY written
+-- as {} (K.MAX_SER_DEPTH), so a modded module's nested params reached the peers
+-- empty and the edit looked identical on both sides while the worlds differed.
+-- Engine params are a finite tree; the only thing recursion must guard against
+-- is a CYCLE, which is a script bug and never engine data. The set of tables on
+-- the current path catches it, and tripping it is LOGGED with the key path (and
+-- counted in CM.serCycles) -- never a quiet {}. The same table under two keys (a
+-- DAG) is not a cycle and serialises in full under each. The reader
+-- (CM.deserParams) is a plain load() of the literal: no depth of ours there
+-- either, and its one failure (the game parser's own nesting limit) is loud.
+CM.serCycles = 0
+local function quoteParam(s)
+	-- Lua 5.2 %q represents LF as a backslash followed by a physical newline.
+	-- Our IPC/network records are lines: use the equivalent Lua escape so a
+	-- module's text (including table keys) cannot split a construction command.
+	return (string.format("%q", s):gsub("\\\n", "\\n"))
+end
+local function serValue(v, onPath, path)
+	local t = type(v)
+	if t == "number" or t == "boolean" then return tostring(v) end
+	if t == "string" then return quoteParam(v) end
+	if t == "table" then
+		if onPath[v] then
+			CM.serCycles = CM.serCycles + 1
+			log(string.format("ser: CYCLE at %s -- the table refers back to an ancestor and has no literal form; written as {} (script bug, not engine data: report this)", path))
+			return "{}"
+		end
+		onPath[v] = true
+		-- Sorted keys: the same table always serialises to the same text.
+		local keys = {}
+		for k in pairs(v) do keys[#keys + 1] = k end
+		table.sort(keys, function(a, b)
+			local ta, tb = type(a), type(b)
+			if ta ~= tb then return ta < tb end
+			if ta == "number" or ta == "string" then return a < b end
+			return tostring(a) < tostring(b)
+		end)
+		local parts = {}
+		for _, k in ipairs(keys) do
+			local key = (type(k) == "number") and ("[" .. k .. "]")
+			                                   or ("[" .. quoteParam(k) .. "]")
+			local inner = serValue(v[k], onPath, path .. key)
+			if inner then parts[#parts + 1] = key .. "=" .. inner end
+		end
+		onPath[v] = nil
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return nil   -- functions/userdata: omit rather than substitute a wrong type
+end
+function CM.ser(v) return serValue(v, {}, "params") end
+
+-- Construction-params DIFF, for strict module edits (CONUP).
+--
+-- The module builder builds each proposal from the ENTITY as it stands at
+-- click time. Under strict the entity does not have the PREVIOUS click's
+-- module yet (it lands at the stamp, ~0.4 s later), so the next click's full
+-- param set lacks it -- and when both replay, the second overwrites the first
+-- away: "only every other platform gets filled" (2026-09-08; the log showed
+-- every fast pair of CONUPs carrying the SAME module count). A click's true
+-- intent is one slot changed. Ship THAT: the difference between the entity's
+-- params at capture and the proposal's, applied onto whatever the entity
+-- holds at the stamp. Diffs compose; snapshots do not.
+--   top  = top-level keys set/changed (non-module)   topdel = removed
+--   mset = modules slot -> record set/changed        mdel   = removed slots
+-- Records compare by their canonical serialisation (ser sorts keys).
+function CM.conDiff(p0, p1)
+	local d = { top = {}, topdel = {}, mset = {}, mdel = {} }
+	p0 = p0 or {}; p1 = p1 or {}
+	for k, v in pairs(p1) do
+		if k ~= "modules" and k ~= "seed" and CM.ser(p0[k]) ~= CM.ser(v) then d.top[k] = v end
+	end
+	for k in pairs(p0) do
+		if k ~= "modules" and k ~= "seed" and p1[k] == nil then d.topdel[k] = true end
+	end
+	local m0, m1 = p0.modules or {}, p1.modules or {}
+	for slot, rec in pairs(m1) do
+		if CM.ser(m0[slot]) ~= CM.ser(rec) then d.mset[slot] = rec end
+	end
+	for slot in pairs(m0) do
+		if m1[slot] == nil then d.mdel[slot] = true end
+	end
+	return d
+end
+
+function CM.conApplyDiff(cur, d)
+	cur = cur or {}
+	for k, v in pairs(d.top or {}) do cur[k] = v end
+	for k in pairs(d.topdel or {}) do cur[k] = nil end
+	cur.modules = cur.modules or {}
+	for slot, rec in pairs(d.mset or {}) do cur.modules[slot] = rec end
+	for slot in pairs(d.mdel or {}) do cur.modules[slot] = nil end
+	return cur
+end
+
+function CM.deserParams(pstr)
+	if not pstr or pstr == "" then return nil end
+	-- pstr comes from other players. An empty environment limits the chunk to
+	-- literals; with the default one a crafted string could reach io and os.
+	local chunk, lerr = load("return " .. pstr, "params", "t", {})
+	if not chunk then
+		-- The game's Lua parser is the one limit left on a params literal (about
+		-- 200 nested syntax levels, its LUAI_MAXCCALLS); nothing of ours cuts
+		-- before it. Say so loudly instead of handing back nil as if the
+		-- originator had shipped nothing -- the callers then REFUSE the command.
+		log(string.format("params: %dB literal does not parse (%s) -- REFUSED, never applied as empty (report this line)", #pstr, tostring(lerr)))
+		return nil, lerr
+	end
+	local ok, v = pcall(chunk)
+	if ok and type(v) == "table" then return v end
+	log(string.format("params: %dB literal did not evaluate to a table (%s) -- REFUSED, never applied as empty (report this line)",
+		#pstr, ok and ("got " .. type(v)) or tostring(v)))
+	return nil, ok and ("not a table: " .. type(v)) or tostring(v)
+end
+
+local knownCons    = {}      -- construction ids already seen (or primed)
+-- Entity ids are reused. A station our replay builds can take the id of a town
+-- building it just demolished, which is still in knownCons, so the poll never adopts
+-- it: every later module edit found "no station within 10 m" and was lost on every
+-- instance (station 45198, 2026-09-11). The builder calls this with the id it got, so
+-- the next poll adopts it through the replay branch (company handover, cost settle).
+-- Returns whether the id was stale.
+function CM.forgetKnownCon(id)
+	local was = knownCons[id] == true
+	knownCons[id] = nil
+	return was
+end
+local ownershipPending = {}  -- buildable con id -> polls waited for PLAYER_OWNED
+CM.consPrimed   = false   -- first poll only records what exists
+-- Names travel percent-escaped: the wire is whitespace-tokenised and a
+-- construction name ("Neckargemünd Train depot") has spaces.
+function CM.escName(s)
+	return (tostring(s or ""):gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end))
+end
+function CM.unescName(s)
+	return (tostring(s or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+CM.expectedCons = {}      -- posKey -> true: our own replay is about to land here
+-- Pairing buffers for CONX: the hook's ROADC street payload arrives within a
+-- tick of the placement; its construction comes from the slice's CONXP, from the
+-- position rescue (findConstructionForRoadc) or from a catch-up scan. Whichever
+-- comes first waits for the other.
+-- Both buffers stamp every record parked in them with its ARRIVAL ORDER (ord,
+-- one counter shared by the two) and the tick it arrived on: inject.lua appends
+-- to them directly, so the stamp is taken in __newindex. A cancelled placement
+-- (CONXP) is paired with its ROADC by that order (see CM.flushConPairs).
+local parkSerial = 0
+local function stampOnPark(t, k, v)
+	if type(v) == "table" and v.ord == nil then
+		parkSerial = parkSerial + 1
+		v.ord = parkSerial
+		v.tick = CM.ticks or 0
+	end
+	rawset(t, k, v)
+end
+CM.pendingRoadc = setmetatable({}, { __newindex = stampOnPark })   -- { at, posOf, adds, rms, spos, etype, stype, ttype, cat, ps?, ord, tick }
+CM.pendingCons  = setmetatable({}, { __newindex = stampOnPark })   -- { at, file, t, params, x, y, id?, cancelled?, ps?, hadRoadc?, survivors?, srad?, ord, tick }
+-- Placement serials whose CONXP inject.lua dropped whole (actions off, far
+-- behind): the ROADC of that serial is released instead of hunted for.
+CM.droppedConxp = CM.droppedConxp or {}
+
+-- Horizontal only, same reasoning as node matching: the engine settles z.
+function CM.conKey(x, y) return string.format("%.1f/%.1f", x, y) end
+
+-- CONP and CONX are both executed by CM.execConX (conx.lua; lockstep.lua's
+-- dispatcher routes them there). The old execConP that lived here was dead code
+-- and still applied unreadable params as {} -- removed 2026-09-16.
+
+-- ---------- station EDITS ----------
+--
+-- Two shapes of edit, both measured by mp_bridge: adding a module through the
+-- UI changes params IN PLACE (same entity id), while upgradeConstruction --
+-- what the peer uses to replay -- REPLACES the entity (old id retires, a new
+-- one appears at the same spot). So constructions are tracked by POSITION, and
+-- a new id at an already-known position is an edit, never a new build.
+CM.consByKey    = {}   -- conKey -> { id=, file=, params=<ser string> }
+local expectedEdit = {}   -- conKey -> true: our own replayed edit is about to replace the entity
+CM.expectedEditOwner = {} -- conKey -> the company that owned the edited building (companies mode)
+CM.primeQueue   = {}   -- ids from the first poll, classified a few per tick
+
+-- Is the entity the table names still THAT construction? Entity ids are
+-- recycled: after a fence segment was bulldozed its id came back as something
+-- else while its record was still in consByKey (the segment next to it, 4 m
+-- away, had passed the "something is still there" check). entityExists then
+-- said yes, getEntity().params read {} and the edit scan shipped a CONU with
+-- empty params -- upgradeConstruction on a non-construction id is a fatal
+-- GetComponentDataIndex assert on every instance (live log, 2026-09-19).
+-- Only an entity with a CONSTRUCTION component of the record's file counts.
+local function conStillThere(rec)
+	local ok = false
+	pcall(function()
+		if not api.engine.entityExists(rec.id) then return end
+		local co = api.engine.getComponent(rec.id, api.type.ComponentType.CONSTRUCTION)
+		ok = co ~= nil and (rec.file == nil or tostring(co.fileName or "") == tostring(rec.file))
+	end)
+	return ok
+end
+
+local function findConNear(file, x, y, maxDist)
+	local best, bestD
+	for key, rec in pairs(CM.consByKey) do
+		if rec.file == file then
+			local kx, ky = key:match("^([-%d.]+)/([-%d.]+)$")
+			kx, ky = tonumber(kx), tonumber(ky)
+			if kx and ky then
+				local d = (kx - x) ^ 2 + (ky - y) ^ 2
+				if d <= maxDist * maxDist and (not bestD or d < bestD) then best, bestD = rec, d end
+			end
+		end
+	end
+	return best
+end
+
+function CM.execConU(c)
+	-- Poll-detected (legacy): the originator already applied it natively.
+	-- STRICT (strict=1, from a CONUP the slice cancelled): nothing changed here
+	-- yet, so the originator upgrades at the stamp like everyone else.
+	if c.origin == K.INSTANCE and tonumber(c.strict or 0) ~= 1 then
+		log(string.format("CONU seq=%d: originator already applied it, skipping", c.seq))
+		return
+	end
+	if c.origin == K.INSTANCE then
+		log(string.format("CONU seq=%d: STRICT -- originator replaying at stamp (local was cancelled)", c.seq))
+	end
+	local ok, err = pcall(function()
+		local x, y = tonumber(c.x), tonumber(c.y)
+		local rec = findConNear(c.file, x, y, 10)
+		local alive = rec ~= nil and conStillThere(rec)
+		if not (rec and alive) then
+			-- the table lost it (a reused entity id): find it in the world instead
+			local found = CM.adoptConAt(tostring(c.file), x, y, 10)
+			if found then rec, alive = found, true end
+		end
+		if not rec then
+			log(string.format("CONU: no %s within 10 m of %.1f,%.1f -- ignoring", tostring(c.file), x, y))
+			return
+		end
+		if not alive then log("CONU: target id " .. rec.id .. " is gone -- ignoring"); return end
+		local shipped = CM.deserParams(c.params)
+		if not shipped and c.params and c.params ~= "" then
+			log(string.format("CONU seq=%s: shipped params could not be read -- edit SKIPPED (DIVERGENCE: %s at %.1f,%.1f keeps its old modules here)",
+				tostring(c.seq), tostring(c.file), x, y))
+			return
+		end
+		local params
+		if tonumber(c.diff or 0) == 1 then
+			-- a strict module edit: one click's change, applied onto whatever
+			-- this entity holds now (so earlier clicks already landed survive)
+			local cur = {}
+			pcall(function() local e = game.interface.getEntity(rec.id); if e and e.params then cur = e.params end end)
+			params = CM.conApplyDiff(cur, shipped or {})
+		else
+			params = shipped or {}
+		end
+		params.seed = nil
+		local key = CM.conKey(x, y)
+		-- COMPANIES: A BUILDING IS ITS OWNER'S TO CHANGE (2026-09-27). A company's
+		-- headquarters was upgraded by another company's player, and the edit landed
+		-- on every machine. The command's company (decided at the stamp) must own the
+		-- building; ownership by company is the same everywhere, so every machine
+		-- refuses alike. The owner is remembered: upgradeConstruction REPLACES the
+		-- entity, and the replacement lands owned by our human player.
+		local ownerCid = nil
+		if CM.cmMode == "companies" then
+			ownerCid = CM.cmCompanyOfPid and CM.cmCompanyOfPid(CM.cmOwnerOf(rec.id)) or nil
+			local by = tonumber(c.company)
+			if ownerCid and by and ownerCid ~= by then
+				log(string.format("CONU seq=%s: %s at %.1f,%.1f belongs to company %d, not %d -- refused", tostring(c.seq), tostring(c.file), x, y, ownerCid, by))
+				if CM.cmLog then CM.cmLog(string.format("CM: CONU seq=%s from %s refused: the building belongs to co%d (sender co%d)", tostring(c.seq), tostring(c.origin), ownerCid, by)) end
+				return
+			end
+		end
+		expectedEdit[key] = true
+		CM.expectedEditOwner[key] = ownerCid
+		local uok, uerr = pcall(game.interface.upgradeConstruction, rec.id, c.file, params)
+		log(string.format("EXEC CONU seq=%s origin=%s at=%s file=%s target=%d ok=%s%s",
+			tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.file), rec.id,
+			tostring(uok), uok and "" or (" err=" .. tostring(uerr))))
+		if uok then
+			rec.params = (tonumber(c.diff or 0) == 1) and CM.ser(params) or c.params
+		else
+			expectedEdit[key] = nil
+			-- Which of the two causes? A no-op self-upgrade with the OWN params of
+			-- the entity must succeed on anything the engine will upgrade at all.
+			-- If it fails, the construction itself cannot be upgraded here --
+			-- mp_bridge saw exactly that on joiner-side stations created by
+			-- buildConstruction -- and the fix belongs in the BUILD replay.
+			local sok, serr = pcall(function()
+				local e = game.interface.getEntity(rec.id)
+				local own = e and e.params or {}
+				own.seed = nil
+				return game.interface.upgradeConstruction(rec.id, c.file, own)
+			end)
+			log(string.format("CONU diagnostic self-upgrade ok=%s%s -> %s", tostring(sok),
+				sok and "" or (" err=" .. tostring(serr)),
+				sok and "our wire params are bad for this construction"
+				    or "this construction cannot be upgraded here at all (build-replay problem)"))
+		end
+	end)
+	if not ok then log("execConU error: " .. tostring(err)) end
+end
+
+local function transfAt(x, y, z)
+	return { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  x, y, z, 1 }
+end
+
+-- Build a construction (depot, station, ...).
+--
+-- Params travel in the command rather than being looked up locally. Two peers
+-- must feed buildConstruction byte-identical params or they get different
+-- buildings from the "same" command -- and `seed` in particular must be absent,
+-- since reusing one drives errorState critical, which is a fatal assert rather
+-- than a rejected proposal.
+function CM.execCon(c)
+	local ok, err = pcall(function()
+		local params = { year = 1850, paramX = 0, paramY = 0 }
+		local built, id = pcall(game.interface.buildConstruction,
+			c.file, params, transfAt(c.x, c.y, c.z))
+		log(string.format("EXEC CON seq=%s origin=%s at=%s file=%s success=%s id=%s",
+			tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.file),
+			tostring(built and id ~= nil), tostring(id)))
+	end)
+	if not ok then log("exec CON error: " .. tostring(err)) end
+end
+
+-- Demolish whatever construction sits nearest a position.
+--
+-- Targeting by POSITION, not entity id, on purpose. Ids are assigned in
+-- creation order; under lockstep with an identical command history they should
+-- match across peers, but that is an assumption this prototype has not verified,
+-- and a wrong id here bulldozes the wrong building. A position is derived from
+-- the command itself and cannot drift. The id tie-break below only matters for
+-- exact-distance ties, which are vanishingly rare.
+-- conKey -> true: a bulldoze we are about to perform on THIS peer as a replay,
+-- so the removal-detector must not ship it straight back.
+CM.expectedDemolish = {}
+
+-- Rejoin a road at a node our replay split, when nothing is attached there any
+-- more.
+--
+-- A construction's own split belongs to the construction: the engine froze it,
+-- so removing the depot heals the road back into one edge. Our replayed split is
+-- a plain pair of street edges that no construction owns, so a peer that splits
+-- for a depot which then fails, gets rolled back or is demolished keeps a
+-- degree-2 node forever -- and every world hash from then on differs by exactly
+-- those edges. Measured 2026-08-30 on a live two-machine session: four such
+-- nodes on the peer, 1193 edges against the host's 1189, desyncs climbing on
+-- every hash tick with nothing left actually diverging.
+--
+-- Only ever touches a plain mid-road node: exactly two street edges, no track,
+-- nothing else hanging off it. Anything else is left alone and logged.
+-- Unowned constructions within r of (x,y): the town-building count the strict
+-- path logs at every step so the next over-demolish names its step.
+function CM.townCountNear(x, y, r)
+	local n = 0
+	pcall(function()
+		for _, id in pairs(game.interface.getEntities({ pos = { x, y }, radius = r or 200 },
+			{ type = "CONSTRUCTION", includeData = false }) or {}) do
+			local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+			if po == nil then n = n + 1 end
+		end
+	end)
+	return n
+end
+
+function CM.healNodeAt(x, y, why, origT)
+	local healed = false
+	pcall(function()
+		local nid = CM.findNodeNear(false, x, y, 1.5)
+		if not nid then return end
+		local tm
+		pcall(function() tm = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+		if tm and tm[nid] then
+			for _ in pairs(tm[nid]) do
+				log(string.format("HEAL(%s): node %d carries track too -- left alone", why, nid)); return
+			end
+		end
+		local m
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+		local ids = {}
+		if m and m[nid] then for _, eid in pairs(m[nid]) do ids[#ids + 1] = eid end end
+		if #ids ~= 2 then
+			log(string.format("HEAL(%s): node %d has %d street edge(s), not 2 -- left alone", why, nid, #ids))
+			return
+		end
+		-- A stop or signal on either half would be left on a removed edge by the
+		-- merge, which crashes the engine (roads.lua CM.carryEdgeObjects). A heal
+		-- is only a tidy-up: leave such a node alone.
+		for _, eid in ipairs(ids) do
+			local _, nobj = CM.objectsOnEdge(eid)
+			if (nobj or 0) > 0 then
+				log(string.format("HEAL(%s): node %d -- edge %d carries %d stop(s)/signal(s), left alone", why, nid, eid, nobj))
+				return
+			end
+		end
+		-- Far endpoints, and the tangent at each pointing along far1 -> far2.
+		-- Tangents in a BaseEdge always run node0 -> node1, so a half whose node0
+		-- is the split node has to be read backwards.
+		local far, tng, len = {}, {}, {}
+		for i, eid in ipairs(ids) do
+			local comp, a, b, ta, tb = CM.edgeGeomT(eid)
+			if not comp then return end
+			local fn, fp, ft
+			if comp.node0 == nid then
+				fn, fp, ft = comp.node1, b, tb
+				if i == 1 then ft = { -ft[1], -ft[2], -ft[3] } end   -- far1: point back at the split
+			else
+				fn, fp, ft = comp.node0, a, ta
+				if i == 2 then ft = { -ft[1], -ft[2], -ft[3] } end   -- far2: point away from the split
+			end
+			far[i], tng[i] = { fn, fp }, ft
+			local dx, dy, dz = b[1] - a[1], b[2] - a[2], b[3] - a[3]
+			len[i] = math.sqrt(dx * dx + dy * dy + dz * dz)
+		end
+		if far[1][1] == far[2][1] then
+			log(string.format("HEAL(%s): node %d joins one edge to itself -- left alone", why, nid)); return
+		end
+		-- Splitting an edge at parameter u scales the halves' tangents by u and
+		-- (1-u). Undo that so the rejoined edge keeps the road's curve instead of
+		-- straightening it; u is recovered from the halves' lengths.
+		local total = (len[1] or 0) + (len[2] or 0)
+		local u = (total > 0.001) and (len[1] / total) or 0.5
+		local s1 = (u > 0.01) and (1.0 / u) or 1.0
+		local s2 = ((1 - u) > 0.01) and (1.0 / (1 - u)) or 1.0
+		local t0 = { tng[1][1] * s1, tng[1][2] * s1, tng[1][3] * s1 }
+		local t1 = { tng[2][1] * s2, tng[2][2] * s2, tng[2][3] * s2 }
+		-- EXACT GEOMETRY when the caller knows it. Reconstructing the merged edge
+		-- by rescaling the stubs' tangents assumes the split left them untouched,
+		-- but a native placement re-shapes them (terrain align + graph cleanup),
+		-- so the merged road is NOT the original road: it sits a little off, and
+		-- the rebuild's own graph cleanup then re-touches it along its length and
+		-- the buildings lining it get cleared -- collateral the peers, whose road
+		-- was never split, never see (measured: A 58 buildings vs peers 60,
+		-- 2026-09-08). The strict replay SHIPS the removed edge with its original
+		-- tangents, so the originator can put back exactly the road that was
+		-- there. origT = {t0x,t0y,t0z, t1x,t1y,t1z} oriented from the shipped
+		-- edge's node0 to node1; our merged edge runs far[1] -> far[2], so orient
+		-- by the chord: if the chord agrees with t0 the ends line up, otherwise
+		-- the shipped edge ran the other way and both tangents flip and swap.
+		if origT and #origT >= 6 then
+			local cx, cy = far[2][2][1] - far[1][2][1], far[2][2][2] - far[1][2][2]
+			if cx * origT[1] + cy * origT[2] >= 0 then
+				t0 = { origT[1], origT[2], origT[3] }
+				t1 = { origT[4], origT[5], origT[6] }
+			else
+				t0 = { -origT[4], -origT[5], -origT[6] }
+				t1 = { -origT[1], -origT[2], -origT[3] }
+			end
+		end
+		local sp = api.type.SimpleProposal.new()
+		local e = api.type.SegmentAndEntity.new()
+		e.entity = -1
+		e.comp.node0 = far[1][1]
+		e.comp.node1 = far[2][1]
+		e.comp.tangent0 = api.type.Vec3f.new(t0[1], t0[2], t0[3])
+		e.comp.tangent1 = api.type.Vec3f.new(t1[1], t1[2], t1[3])
+		e.comp.type = 0
+		e.comp.typeIndex = -1
+		e.type = 0
+		CM.copyEdgeProps(e, ids[1], false, nil)
+		sp.streetProposal.edgesToAdd[1] = e
+		sp.streetProposal.edgesToRemove[1] = ids[1]
+		sp.streetProposal.edgesToRemove[2] = ids[2]
+		-- The node has to go with them. Dropping only the two edges leaves the
+		-- engine to reconcile an orphan node and it refuses the whole proposal
+		-- with critical=true and 'Internal error (see console for details)'
+		-- (measured on the live peer, 2026-08-30).
+		sp.streetProposal.nodesToRemove[1] = nid
+		-- NEVER ignoreErrors here. A heal rebuilds the two stubs as ONE merged
+		-- edge, and that reconstituted Hermite is not bit-identical to the
+		-- original road -- it swings a little through whatever lines it. With
+		-- ignoreErrors=true the engine resolved that collision by BULLDOZING the
+		-- buildings: the strict pre-rebuild heal on the originator removed a
+		-- column of five town buildings directly north of the healed node that
+		-- both peers (whose road was never split, so never healed) kept -- a
+		-- construction-lane DESYNC (59 vs 65 buildings, measured 2026-09-08).
+		-- A road merge must never demolish anything. If the merge would
+		-- collide, the engine refuses it; the split node and stubs then simply
+		-- stay, which every consumer already tolerates (findEdgeContaining
+		-- position-resolves against a stub just as well as a through-road).
+		-- gatherBuildings=FALSE is the whole point. A merge with a nil context
+		-- uses the engine default, which GATHERS (demolishes) town buildings in
+		-- the merged edge's footprint -- 7 of them on the strict originator,
+		-- buildings the peers (who never split, never heal) kept, so A ended 6
+		-- short and the town-building lane desynced (2026-09-08). The peers'
+		-- own depot build sets exactly this flag (conxContext, gatherBuildings
+		-- =false) and clears obstacles ONLY through the shared survivor-diff.
+		-- The heal must do the same: merge the road, demolish NOTHING, and let
+		-- A's survivor-diff -- the identical code and the same shipped survivor
+		-- list as the peers -- converge A to the exact same building set.
+		-- checkTerrainAlignment=false too: this is putting back a road that was
+		-- already there, not shaping a new one.
+		local hctx = nil
+		pcall(function()
+			local c = api.type.Context:new()
+			c.checkTerrainAlignment = false
+			c.cleanupStreetGraph    = true
+			c.gatherBuildings       = false
+			c.gatherFields          = true
+			c.player                = api.engine.util.getPlayer()
+			hctx = c
+		end)
+		local cmd = api.cmd.make.buildProposal(sp, hctx, false)
+		if not cmd then return end
+		healed = true
+		api.cmd.sendCommand(cmd, function(res, ok2)
+			local extra = ""
+			if not ok2 then
+				pcall(function()
+					local es = res.resultProposalData and res.resultProposalData.errorState
+					if es then
+						extra = " critical=" .. tostring(es.critical)
+						for i = 1, #es.messages do extra = extra .. " '" .. tostring(es.messages[i]) .. "'" end
+					end
+				end)
+			end
+			log(string.format("HEAL(%s): node %d at %.1f,%.1f rejoined: %s%s | town buildings within 200 m now: %d",
+				why, nid, x, y, tostring(ok2), extra, CM.townCountNear(x, y, 200)))
+		end)
+	end)
+	return healed
+end
+
+-- ORPHANED SPLITS, CHECKED ON A FIXED SIM STEP (2026-09-12).
+-- A split that is doing its job carries the construction's access as a third
+-- edge; one left with exactly two is a scar from a construction that never
+-- landed, was rolled back, or has since been demolished, and it is healed.
+--
+-- Each watched split is checked ONCE, as a HEALCHK in the step-locked queue, due
+-- CM.SPLIT_SETTLE_STEPS after the stamp of the command that cut it (a CONX) or of
+-- a demolish near it -- so the pump runs it on the same sim step on every
+-- instance. It used to be a frame-tick sweep (CM.ticks), and each game healed on
+-- its own step: the rebuilt road rerouted passengers at different moments, the
+-- people counts split at t=3024 and the buses drifted into a vehicle DESYNC at
+-- t=3156 on all three games (the world hash never differed).
+CM.splitWatch = {}            -- site key -> the step its queued check is due
+CM.SPLIT_SETTLE_STEPS = 25    -- 5 game units: past the construction's own apply and a retry behind it
+
+local function splitKey(x, y) return string.format("%.1f/%.1f", x, y) end
+
+-- c: the stamped command this watch comes from ({at, origin, seq} is enough).
+function CM.watchSplit(x, y, c)
+	if not (c and c.at and c.origin and c.seq) then
+		log(string.format("HEAL: split at %.1f,%.1f has no command stamp -- not watched", x, y))
+		return
+	end
+	local k = splitKey(x, y)
+	local due = CM.stepOf(c.at) + CM.SPLIT_SETTLE_STEPS
+	if CM.splitWatch[k] == due then return end   -- the capture and the exec of one CONX
+	CM.splitWatch[k] = due
+	-- a key of its own, the same on every instance: the parent's stamp and seq plus
+	-- a fraction from the site's position (several sites of one command sort alike)
+	local frac = ((math.floor(x * 10 + 0.5) * 31 + math.floor(y * 10 + 0.5)) % 99991) / 1e6
+	CM.retryQueue = CM.retryQueue or {}
+	CM.retryQueue[#CM.retryQueue + 1] = { op = "HEALCHK", at = c.at, origin = c.origin,
+		seq = (tonumber(c.seq) or 0) + 0.25 + frac, x = x, y = y, notBeforeStep = due }
+end
+
+-- Something was demolished at x,y (c: the DEMOLISH): every split we ever cut
+-- nearby is checked again, on a step fixed from that command's stamp.
+function CM.rearmSplitsNear(x, y, c)
+	for _, site in pairs(CM.splitSites or {}) do
+		local dx, dy = site[1] - x, site[2] - y
+		if dx * dx + dy * dy < 60 * 60 then CM.watchSplit(site[1], site[2], c) end
+	end
+end
+
+function CM.execHealCheck(c)
+	local x, y = tonumber(c.x), tonumber(c.y)
+	if not (x and y) then return end
+	local k = splitKey(x, y)
+	if CM.splitWatch[k] == c.notBeforeStep then CM.splitWatch[k] = nil end
+	local nid = CM.findNodeNear(false, x, y, 1.5)
+	local n = 0
+	if nid then
+		local m
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+		if m and m[nid] then for _ in pairs(m[nid]) do n = n + 1 end end
+	end
+	if not nid then
+		return                                       -- already gone
+	elseif n ~= 2 then
+		-- In use today. But the construction it serves can be demolished later,
+		-- and on this instance nothing owns the split -- keep the site, and check
+		-- it again whenever something near it is demolished (review, 2026-08-31).
+		CM.splitSites = CM.splitSites or {}
+		CM.splitSites[k] = { x, y }
+	else
+		CM.healNodeAt(x, y, string.format("orphaned split, step %d", CM.stepOf(CM.gameTime() or 0)))
+	end
+end
+
+
+function CM.execDemolish(c)
+	-- Poll-detected (legacy) demolish: the originator already bulldozed its own
+	-- construction (the removal detector fired BECAUSE it was gone locally), so
+	-- only the peers replay. STRICT (strict=1, from a CDEMO the slice cancelled):
+	-- nothing has been removed anywhere yet, so the originator replays too and
+	-- everyone bulldozes on the same sim-step.
+	local strict = tonumber(c.strict or 0) == 1
+	if c.origin == K.INSTANCE and not strict then
+		log(string.format("DEMOLISH seq=%s: originator already bulldozed locally, skipping", tostring(c.seq)))
+		-- the originator's scars still heal on the same step as everyone else's
+		CM.rearmSplitsNear(c.x, c.y, c)
+		return
+	end
+	local ok, err = pcall(function()
+		local best, bestD
+		local ents = game.interface.getEntities({ radius = 999999 },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		-- Strict matches EXACTLY (same file, within 2 m): if the cancel ever
+		-- fails and the native bulldoze runs, the nearest-in-30m rule would take
+		-- out a neighbour instead. Legacy keeps the 30 m rule -- its position
+		-- comes from a key rounded to 0.1 m and it has no file to check.
+		local limit = strict and 4 or 900
+		for _, id in pairs(ents) do
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			if co and co.transf then
+				local dx, dy = co.transf[13] - c.x, co.transf[14] - c.y
+				local d = dx * dx + dy * dy
+				local fileOk = (not strict) or (c.file == nil or c.file == "" or tostring(co.fileName or "") == tostring(c.file))
+				if d < limit and fileOk and (not bestD or d < bestD or (d == bestD and id < best)) then
+					best, bestD = id, d
+				end
+			end
+		end
+		if not best then
+			log(string.format("EXEC DEMOLISH seq=%s: nothing %s of %.1f,%.1f%s",
+				tostring(c.seq), strict and "matching within 2m" or "within 30m", c.x, c.y,
+				strict and " (already gone here -- no-op)" or ""))
+			return
+		end
+		-- Mark the spot so our own removal-detector recognises this as a replay
+		-- (our construction is about to vanish) and does not echo it back.
+		CM.expectedDemolish[CM.conKey(c.x, c.y)] = true
+		-- companies mode: a remote company's copy was setBulldozeable(false)'d to
+		-- stop the local HUMAN removing it -- but that lock also refuses OUR
+		-- scripted replay of the owner's own demolish. Unlock first, exactly as
+		-- the "Multiplayer Companies" mod does before every removal (it always
+		-- setBulldozeable(true)s ahead of bulldoze). Guarded by the CONSTRUCTION
+		-- check since setBulldozeable asserts (uncatchable) on other entity types.
+		local owner = CM.cmOwnerOf(best)
+		local unlocked = "n/a"
+		if CM.cmMode == "companies" then
+			local hasCon = false
+			pcall(function() hasCon = api.engine.getComponent(best, api.type.ComponentType.CONSTRUCTION) ~= nil end)
+			if hasCon then
+				local okU, errU = pcall(function() game.interface.setBulldozeable(best, true) end)
+				unlocked = tostring(okU) .. (errU and (" " .. tostring(errU)) or "")
+			else unlocked = "skipped(noCON)" end
+		end
+		-- Refund attribution. A poll-detected demolish is OPTIMISTIC: the
+		-- originator bulldozes natively at click, the peer replays here ~a few
+		-- game-units later, so the balance moves at different sim-times and any
+		-- refund difference is a lasting coop money gap (measured 2026-09-02: two
+		-- depot demolishes opened a ~175k split). A STRICT one (CDEMO)
+		-- lands this same bulldoze on every instance at the stamp, originator
+		-- included, so the refund is simultaneous. The measurement stays for
+		-- both, so the log shows which case this was.
+		local bal0 = CM.cmBalance(api.engine.util.getPlayer())
+		local dok, derr = pcall(game.interface.bulldoze, best)
+		local bal1 = CM.cmBalance(api.engine.util.getPlayer())
+		if bal0 and bal1 then
+			log(string.format("DEMOLISH seq=%s: refund on this peer = %+d (%d -> %d)", tostring(c.seq), bal1 - bal0, bal0, bal1))
+		end
+		CM.rearmSplitsNear(c.x, c.y, c)
+		log(string.format("EXEC DEMOLISH seq=%s origin=%s at=%s id=%d success=%s",
+			tostring(c.seq), tostring(c.origin), tostring(c.at), best, tostring(dok)))
+		CM.cmLog(string.format("CM: DEMOLISH seq=%s id=%d owner=%s unlock=%s bulldoze ok=%s err=%s",
+			tostring(c.seq), best, tostring(owner), unlocked, tostring(dok), tostring(derr)))
+	end)
+	if not ok then log("exec DEMOLISH error: " .. tostring(err)) end
+end
+
+-- ---------- EDEMO: a bulldozed road/rail EDGE ----------
+--
+-- The gap this closes: every replicated op ADDED or edited. The only removals
+-- that crossed were constructions, vehicles, lines and stops -- never a road.
+-- The slice saw the bulldozer ("BULLDOZE re=1 ... edge-demolish shape") and
+-- only wrote it to the log, so demolishing a road was a silent LOCAL edit. The
+-- originator's road vanished, every peer kept theirs, and the e and z lanes
+-- diverged on the spot. It reads as a lag artifact -- "I demolished during lag
+-- and the crossing did not form" -- but lag only widens the window in which the
+-- player does it. The demolish never replicated at any speed (2026-09-03).
+--
+-- Nothing here names an edge by ID. c.params carries the removed edges as
+-- ENDPOINT POSITIONS, "x0,y0,z0,x1,y1,z1;..." -- the peer finds the node
+-- nearest each end and takes the edge BETWEEN them. Positions are identical
+-- across instances (same save, same replayed proposals) while entity ids are
+-- not, and a bulldoze aimed by a divergent id would destroy the wrong road with
+-- nothing to rebuild it from. See [[replicate-positions-not-entity-ids]].
+-- "x0,y0,z0,x1,y1,z1,kind;..." -> { {x0,y0,z0,x1,y1,z1,kind}, ... }
+local function edemoPairs(params)
+	local out = {}
+	for rec in tostring(params or ""):gmatch("[^;]+") do
+		local v = {}
+		for f in rec:gmatch("[^,]+") do v[#v + 1] = tonumber(f) end
+		if #v >= 7 then out[#out + 1] = v end
+	end
+	return out
+end
+
+-- Nearest node to each endpoint, searching ONLY the map of that endpoint's own
+-- KIND. A road node and a rail node can sit at the same spot and are different
+-- nodes; matching across kinds is how findNodeNear once welded track to street,
+-- and here it would bulldoze the road beside a level crossing instead of the
+-- rail the player actually removed.
+--
+-- The node index: both edge maps and every node's position, bucketed into
+-- EDEMO_CELL-metre cells, built ONCE and reused by every EDEMO that runs before
+-- the world changes. A dragged bulldoze arrives as one EDEMO per edge, and a
+-- full scan each (both maps, every node's position: tens of thousands of
+-- component reads) froze both games for 12.6 s over 173 EDEMOs on one step
+-- (2026-09-24). Reuse is exact, not approximate: the index lives only for the
+-- current update() tick (the sim cannot move inside one) and is dropped the
+-- moment anything may have edited the network -- this file's own proposal
+-- below, or any other command (execute() in lockstep.lua). So every lookup sees
+-- the same world a fresh scan would, and peers still agree.
+local EDEMO_CELL = 4   -- metres; must be >= the match radius sqrt(K.EDEMO_TOL_SQ)
+local function edemoCellKey(x, y)
+	return (math.floor(x / EDEMO_CELL) + 1048576) * 2097152 + (math.floor(y / EDEMO_CELL) + 1048576)
+end
+
+local function edemoIndex()
+	local ix = CM.edemoCache
+	if ix and ix.tick == CM.ticks then
+		ix.reused = ix.reused + 1
+		return ix
+	end
+	local t0 = os.clock()
+	ix = { tick = CM.ticks, byKind = {}, grid = { [0] = {}, [1] = {} }, reused = 0, nodes = 0 }
+	pcall(function() ix.byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	pcall(function() ix.byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+	for kind = 0, 1 do
+		local m, g = ix.byKind[kind], ix.grid[kind]
+		if m then
+			for nid in pairs(m) do
+				local pos = CM.nodePosXYZ(nid)
+				if pos then
+					local key = edemoCellKey(pos[1], pos[2])
+					local cell = g[key]
+					if not cell then cell = {}; g[key] = cell end
+					cell[#cell + 1] = { nid, pos[1], pos[2] }
+					ix.nodes = ix.nodes + 1
+				end
+			end
+		end
+	end
+	ix.buildMs = (os.clock() - t0) * 1000
+	CM.edemoCache = ix
+	return ix
+end
+
+-- Nearest node to each endpoint, within K.EDEMO_TOL_SQ, in that endpoint's own
+-- kind. Only the 3x3 cells around the endpoint can hold a node that close, so
+-- the answer is the full scan's: same candidates, same distance, ties broken by
+-- the lower id so every peer agrees.
+local function edemoMatchNodes(want)
+	local ix = edemoIndex()
+	local best, bestD = {}, {}
+	for i, w in ipairs(want) do
+		local g = ix.grid[w[4]]
+		local cx, cy = math.floor(w[1] / EDEMO_CELL), math.floor(w[2] / EDEMO_CELL)
+		for gx = cx - 1, cx + 1 do
+			for gy = cy - 1, cy + 1 do
+				local cell = g[(gx + 1048576) * 2097152 + (gy + 1048576)]
+				if cell then
+					for _, n in ipairs(cell) do
+						local nid = n[1]
+						local dx, dy = n[2] - w[1], n[3] - w[2]
+						local d = dx * dx + dy * dy
+						if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
+								or (d == bestD[i] and nid < best[i])) then
+							best[i], bestD[i] = nid, d
+						end
+					end
+				end
+			end
+		end
+	end
+	return best, ix.byKind, ix
+end
+CM.edemoMatchNodes = edemoMatchNodes   -- for tools/edge_demolition_test.py
+
+function CM.execEdgeDemolish(c)
+	-- NO originator skip. The slice CANCELS the player's bulldoze at
+	-- CommandList::Add and this replays it at the stamp, so all three instances
+	-- remove the road at the same game-time -- the same cancel-and-replay
+	-- architecture as roads, upgrades, vehicles and lines. Compare execDemolish
+	-- above, which does skip: a CONSTRUCTION demolish is found by a poll AFTER
+	-- it has already happened locally, so there is nothing left to replay here.
+	--
+	-- If the cancel could not be honoured (the slice cannot fire the bulldozer's
+	-- completion callback and lets it run rather than wedge the tool) the road
+	-- is already gone on this instance. That is not an error: nothing matches
+	-- and it logs "nothing to remove". Replay is idempotent by construction.
+	local ok, err = pcall(function()
+		local prs = edemoPairs(c.params)
+		if #prs == 0 then
+			log(string.format("EDEMO seq=%s: no endpoint pairs in params", tostring(c.seq)))
+			return
+		end
+		-- flatten both ends of every edge into one match list
+		-- want[i] = {x, y, z, kind}; two entries per removed edge
+		local want = {}
+		for _, v in ipairs(prs) do
+			local kind = (v[7] == 1) and 1 or 0
+			want[#want + 1] = { v[1], v[2], v[3], kind }
+			want[#want + 1] = { v[4], v[5], v[6], kind }
+		end
+		local nodes, byKind, ix = edemoMatchNodes(want)
+		if ix.reused == 0 then
+			log(string.format("EDEMO seq=%s: node index built (%d nodes, %.0f ms)", tostring(c.seq), ix.nodes, ix.buildMs or 0))
+		end
+
+		local rmSet, rmList, unmatched = {}, {}, 0
+		for i = 1, #prs do
+			local a, b = nodes[i * 2 - 1], nodes[i * 2]
+			if not (a and b) then
+				unmatched = unmatched + 1
+				log(string.format("EDEMO seq=%s: edge %d unmatched (endpoint node missing: a=%s b=%s)",
+					tostring(c.seq), i, tostring(a), tostring(b)))
+			else
+				-- the edge between them = the intersection of their edge
+				-- lists, taken in THIS edge's own map only
+				local found
+				local m = byKind[(prs[i][7] == 1) and 1 or 0]
+				local ea, eb = m and m[a], m and m[b]
+				if ea and eb then
+					local inA = {}
+					for _, e in pairs(ea) do inA[e] = true end
+					for _, e in pairs(eb) do
+						if inA[e] and (not found or e < found) then found = e end
+					end
+				end
+				if found then
+					if not rmSet[found] then
+						rmSet[found] = true
+						rmList[#rmList + 1] = found
+					end
+				else
+					unmatched = unmatched + 1
+					log(string.format("EDEMO seq=%s: edge %d: nodes %d/%d matched but no edge between them",
+						tostring(c.seq), i, a, b))
+				end
+			end
+		end
+		-- SAFETY NET (2026-09-08): removing an edge that still carries an edge
+		-- object (a stop or a signal a line references) is a fatal engine
+		-- assert -- one EDEMO of that kind took all three instances down with a
+		-- minidump each. The slice no longer ships that shape (it is an edge
+		-- replace, not a demolish), but a stale or foreign command must not be
+		-- able to crash a peer: drop such edges here and say so.
+		do
+			local kept = {}
+			for _, eid in ipairs(rmList) do
+				local nobj = 0
+				pcall(function()
+					local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+					if be and be.objects then nobj = #be.objects end
+				end)
+				if nobj > 0 then
+					rmSet[eid] = nil
+					log(string.format("EDEMO seq=%s: edge %d carries %d edge object(s) -- REFUSED (fatal engine assert; DIVERGENCE if the originator removed it)",
+						tostring(c.seq), eid, nobj))
+				else
+					kept[#kept + 1] = eid
+				end
+			end
+			rmList = kept
+		end
+		if #rmList == 0 then
+			log(string.format("EDEMO seq=%s: nothing to remove (%d unmatched)", tostring(c.seq), unmatched))
+			return
+		end
+
+		-- A node left with no edges at all makes the engine refuse the whole
+		-- proposal as critical ("Internal error"), so orphans go WITH the edges.
+		-- Derived here rather than shipped: what is orphaned depends on this
+		-- world's edge lists, and the originator's answer need not be ours.
+		local orphans, orphSet = {}, {}
+		for i = 1, #want do
+			local nid = nodes[i]
+			if nid and not orphSet[nid] then
+				local total, killed = 0, 0
+				for k = 0, 1 do
+					local m = byKind[k]
+					for _, e in pairs((m and m[nid]) or {}) do
+						total = total + 1
+						if rmSet[e] then killed = killed + 1 end
+					end
+				end
+				if total > 0 and killed == total then
+					orphSet[nid] = true
+					orphans[#orphans + 1] = nid
+				end
+			end
+		end
+
+		local sp = api.type.SimpleProposal.new()
+		for i, eid in ipairs(rmList) do sp.streetProposal.edgesToRemove[i] = eid end
+		for i, nid in ipairs(orphans) do sp.streetProposal.nodesToRemove[i] = nid end
+		-- Removing the last rail at a road crossing also needs the engine to
+		-- clean up the surviving shared node. Orphan removal alone is not
+		-- enough: without graph cleanup both peers reject the rail stub.
+		local ctx = api.type.Context.new()
+		ctx.cleanupStreetGraph = true
+		local cmd = api.cmd.make.buildProposal(sp, ctx, true)
+		if not cmd then
+			log(string.format("EDEMO seq=%s: buildProposal returned nil", tostring(c.seq)))
+			return
+		end
+		local nEdges, nOrph = #rmList, #orphans
+		-- the network is about to change (edges, orphans, graph cleanup merges):
+		-- the next EDEMO must see the new one
+		CM.edemoCache = nil
+		api.cmd.sendCommand(cmd, function(res, ok2)
+			local extra = ""
+			if not ok2 then
+				pcall(function()
+					local es = res.resultProposalData and res.resultProposalData.errorState
+					if es then
+						extra = string.format(" critical=%s msg=%s", tostring(es.critical),
+							tostring(es.messages and es.messages[1]))
+					end
+				end)
+			end
+			log(string.format("EXEC EDEMO seq=%s origin=%s at=%s: removed %d edge(s) + %d orphan node(s) success=%s%s",
+				tostring(c.seq), tostring(c.origin), tostring(c.at), nEdges, nOrph, tostring(ok2), extra))
+		end)
+	end)
+	if not ok then log("exec EDEMO error: " .. tostring(err)) end
+end
+
+-- Deep-copy a params table so a per-sample mutation cannot leak into the next.
+function CM.deepcopy(t)
+	if type(t) ~= "table" then return t end
+	local r = {}
+	for k, v in pairs(t) do r[k] = CM.deepcopy(v) end
+	return r
+end
+-- Watch for constructions the player just built and ship them. Runs on every
+-- peer; a construction that WE replayed is recognised by its position and not
+-- echoed back, otherwise two peers would ping-pong the same station forever.
+-- Only the PLAYER's constructions replicate. Town growth creates CONSTRUCTION
+-- entities continuously (building/era_b/res_1_2x2_01.con and friends -- about
+-- one every ten seconds per town), and the first version of this poll shipped
+-- twenty of them from EACH side in three minutes: every peer would have
+-- replayed the other's town growth on top of its own. A blacklist of guessed
+-- prefixes was the wrong shape; ownership is the real discriminator, with a
+-- whitelist of things a player can actually place as the fallback.
+function CM.isPlayerConstruction(id, fileName)
+	local owned = nil
+	pcall(function()
+		local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+		if po ~= nil then
+			-- Any owner is a player: the human, or a company's AI player entity
+			-- (companies mode puts a remote company's copy on that company's entity,
+			-- and it must stay tracked -- consByKey -- or reassigning it evicts it
+			-- and the owner's later demolish/edit finds nothing). Town buildings and
+			-- industries carry no PLAYER_OWNED at all. This used to accept only the
+			-- human plus the pids in CM.cmCompanyPid, which the save's state fills in
+			-- lazily: a joiner's first hash samples after the load gate ran BEFORE that
+			-- (2026-09-16, t=6668/6672: c1 t:696 against the host's c13 t:684), the
+			-- town lane counted the other companies' 12 stations as town buildings
+			-- for two stamps, and a false "DESYNC town +12" was declared.
+			owned = po.player ~= nil and po.player ~= -1
+		else
+			owned = false
+		end
+	end)
+	if owned ~= nil then return owned end
+	-- component check unavailable: fall back to what a player can build
+	for _, p in ipairs({ "station/", "depot/", "asset/", "airport/", "harbor/", "harbour/" }) do
+		if fileName:sub(1, #p) == p then return true end
+	end
+	return false
+end
+
+K.CON_EDIT_SCAN_EVERY = 30
+K.PRIME_PER_TICK = 100
+
+-- Record (or refresh) what we know about a live construction at its position.
+-- Returns the previous record at that position, if any.
+local function noteCon(id, fn, key, pstr)
+	local prev = CM.consByKey[key]
+	CM.consByKey[key] = { id = id, file = fn, params = pstr }
+	return prev
+end
+
+-- The additive Fences replay knows its result id; register that exact entity
+-- before a catch-up scan can mistake it for an unsynchronized native build.
+function CM.registerFenceReplay(id, file, params)
+	if type(id) ~= "number" or id < 0 or not api.engine.entityExists(id) then return end
+	local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+	if not co or tostring(co.fileName) ~= file or not co.transf then return end
+	knownCons[id] = true
+	noteCon(id, file, CM.conKey(co.transf[13], co.transf[14]), params)
+end
+
+-- The live player construction of `file` nearest (x, y) within maxDist, looked up in
+-- the WORLD rather than consByKey, and registered. The edit replay's fallback for a
+-- station the table lost -- a reused entity id the poll skipped, or an upgrade whose
+-- replacement took one -- so the edit lands instead of being dropped.
+function CM.adoptConAt(file, x, y, maxDist)
+	local bestId, bestD, bestCo
+	pcall(function()
+		local list = game.interface.getEntities({ pos = { x, y }, radius = maxDist },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		for _, id in pairs(list) do
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			if co and co.transf and co.fileName and tostring(co.fileName) == file
+			   and CM.isPlayerConstruction(id, file) then
+				local d = (co.transf[13] - x) ^ 2 + (co.transf[14] - y) ^ 2
+				if d <= maxDist * maxDist and (not bestD or d < bestD) then bestId, bestD, bestCo = id, d, co end
+			end
+		end
+	end)
+	if not bestId then return nil end
+	local key = CM.conKey(bestCo.transf[13], bestCo.transf[14])
+	local pstr = "{}"
+	pcall(function() local e = game.interface.getEntity(bestId); if e and e.params then pstr = CM.ser(e.params) end end)
+	local prev = CM.consByKey[key]
+	knownCons[bestId] = true
+	noteCon(bestId, file, key, pstr)
+	log(string.format("con: adopted %s id %d at %s -- the table %s (reused entity id)", file, bestId, key,
+		prev and ("still named dead id " .. tostring(prev.id)) or "had nothing there"))
+	return CM.consByKey[key]
+end
+
+local function shipEdit(fn, key, pstr)
+	local kx, ky = key:match("^([-%d.]+)/([-%d.]+)$")
+	CM.scheduleLocal("CONU", { file = fn, x = tonumber(kx), y = tonumber(ky), params = pstr })
+	log(string.format("con: edit captured %s at %s params=%dB", fn, key, #pstr))
+end
+
+-- Survivor gather radius: the construction's EXTENT plus this margin. Nothing
+-- fixed. Until 2026-09-16 the gather was a 200 m disk and the peer judged 190 m
+-- of it, so a big station, airport or harbour left every town building beyond
+-- 190 m of its origin standing on the peers -- with no log line. The extent is
+-- what both ends can agree on: the built entity's BOUNDING_VOLUME (the originator
+-- has it for a native build), every node of the street payload the placement
+-- carried (split, connectors, apron) and the origin itself. The margin covers
+-- what a placement demolishes BEYOND that extent: the origin of the biggest town
+-- lot its footprint grazes (about 60 m across) and the terrain skirt a graded
+-- placement cuts past its bounding box. A bigger disk only lists more survivors;
+-- the peer judges K.SURV_INNER m inside the shipped radius (c.srad) so nothing it
+-- never listed is judged.
+K.SURV_MARGIN = 100
+K.SURV_INNER  = 10
+
+-- Radius of the disk around (cx,cy) that covers the construction `selfId` (its
+-- bounding box, when it exists) and every point in `pts` ({x,y} list), plus the
+-- margin. Second result: where the extent came from, for the log.
+function CM.survivorRadius(cx, cy, selfId, pts)
+	local far, from = 0, {}
+	if selfId then
+		pcall(function()
+			local bv = api.engine.getComponent(selfId, api.type.ComponentType.BOUNDING_VOLUME)
+			local bb = bv and bv.bbox
+			if not (bb and bb.min and bb.max) then return end
+			for _, px in ipairs({ bb.min.x, bb.max.x }) do
+				for _, py in ipairs({ bb.min.y, bb.max.y }) do
+					local d = math.sqrt((px - cx) ^ 2 + (py - cy) ^ 2)
+					if d > far then far = d end
+				end
+			end
+			from[#from + 1] = string.format("bbox %.0fx%.0f m", bb.max.x - bb.min.x, bb.max.y - bb.min.y)
+		end)
+	end
+	if pts and #pts > 0 then
+		local farP = 0
+		for _, p in ipairs(pts) do
+			local d = math.sqrt((p[1] - cx) ^ 2 + (p[2] - cy) ^ 2)
+			if d > farP then farP = d end
+		end
+		if farP > far then far = farP end
+		from[#from + 1] = string.format("%d street node(s) out to %.0f m", #pts, farP)
+	end
+	if #from == 0 then from[1] = "origin only (no entity, no street payload)" end
+	return far + K.SURV_MARGIN, table.concat(from, ", ")
+end
+
+-- Town constructions + asset groups still standing in the extent-derived disk
+-- around (cx,cy) (CM.survivorRadius), as "x:y;x:y;..." (nil if none), plus the
+-- radius used. Shipped with a CONX/CONP so the peer removes exactly the in-disk
+-- town buildings that the originator's world no longer has -- no pad, no bbox,
+-- no corridor width to guess. `pts` is the street payload's node positions when
+-- the placement carried one. Used by BOTH emit paths (queueConCapture and
+-- findConstructionForRoadc: the latter never carried survivors, which is why
+-- every station shipped `survivors=0`, 2026-08-29), and again at ship time with
+-- the full extent (shipConxPair / flushConPairs).
+-- Returns nil, nil when the gather itself FAILED: the peer must then not read
+-- the list as empty (an empty list with a radius means "nothing survived here").
+function CM.gatherSurvivors(cx, cy, selfId, pts)
+	local surv = {}
+	local radius, from = CM.survivorRadius(cx, cy, selfId, pts)
+	local ok, err = pcall(function()
+		local near = game.interface.getEntities({ pos = { cx, cy }, radius = radius },
+			{ type = "CONSTRUCTION", includeData = false })
+		-- nil is NOT an empty list: with srad on the wire an empty list tells the
+		-- peer to level every unlisted town building in the disk, so a query that
+		-- returned nothing at all is a failed gather (no list, no radius, loud)
+		if near == nil then error("getEntities(CONSTRUCTION) returned nil") end
+		for _, sid in pairs(near) do
+			if sid ~= selfId then
+				local cco = api.engine.getComponent(sid, api.type.ComponentType.CONSTRUCTION)
+				local po = api.engine.getComponent(sid, api.type.ComponentType.PLAYER_OWNED)
+				if cco and po == nil and cco.transf then surv[#surv + 1] = string.format("%.1f:%.1f", cco.transf[13], cco.transf[14]) end
+			end
+		end
+		local assets = game.interface.getEntities({ pos = { cx, cy }, radius = radius },
+			{ type = "ASSET_GROUP", includeData = false })
+		if assets == nil then error("getEntities(ASSET_GROUP) returned nil") end
+		for _, sid in pairs(assets) do
+			local okE, e = pcall(game.interface.getEntity, sid)
+			local px = okE and e and e.position and (e.position[1] or e.position.x)
+			local py = okE and e and e.position and (e.position[2] or e.position.y)
+			if px and py then surv[#surv + 1] = string.format("%.1f:%.1f", px, py) end
+		end
+	end)
+	if not ok then
+		log(string.format("STN: survivor gather around (%.1f,%.1f) r=%.0f FAILED (%s) -- shipping no list; the peers fall back to the track corridor (report this)",
+			cx, cy, radius, tostring(err)))
+		return nil, nil
+	end
+	CM.cmLog(string.format("STN: gathered %d survivor(s) around (%.1f,%.1f) within %.0f m (%s, + %d m margin)",
+		#surv, cx, cy, radius, from, K.SURV_MARGIN))
+	return (#surv > 0) and table.concat(surv, ";") or nil, radius
+end
+
+local function queueConCapture(fn, key, pstr, transf, id)
+	-- balance before this construction existed (previous poll), so the strict
+	-- path can refund exactly what the native copy cost
+	if CM.balPrevConPoll then CM.conBal0[key] = CM.balPrevConPoll end
+	local t = {}
+	for i = 1, 16 do t[i] = string.format("%.4f", transf[i]) end
+	-- The UI names a construction as part of placing it ("<town> Train
+	-- depot"); a replica without that name is the one visible difference
+	-- left against a UI-built one, and clicking unnamed script-built
+	-- constructions crashed the client. Ship the originator's name.
+	local name = ""
+	pcall(function()
+		local nc = api.engine.getComponent(id, api.type.ComponentType.NAME)
+		if nc and nc.name then name = tostring(nc.name) end
+	end)
+	-- EXACT obstacle clearing: the game's placement demolished only what its real
+	-- footprint collided with. We cannot see that list after the fact -- but its
+	-- COMPLEMENT is visible: the town constructions/assets still standing nearby.
+	-- Ship those survivors (by position); the peer clears only obstacles that are
+	-- NOT survivors, so the two towns lose exactly the same buildings. This
+	-- replaces the old 60x30 m pad, which over-demolished on the peer.
+	local survivors, srad = CM.gatherSurvivors(transf[13], transf[14], id)
+	CM.pendingCons[#CM.pendingCons + 1] = { at = CM.gameTime() or 0, file = fn, key = key,
+	                                  t = table.concat(t, ","), params = pstr,
+	                                  x = transf[13], y = transf[14], name = CM.escName(name),
+	                                  bal0 = CM.balPrevConPoll,  -- balance before this build; ships as the true cost
+	                                  survivors = survivors, srad = srad,
+	                                  id = id }   -- the entity: its frozen nodes identify its ROADC, its bbox the extent
+end
+
+-- Every world position a parked ROADC carries: its new nodes (posOf) and the
+-- existing nodes its edges end on (spos). The payload's extent, and the points
+-- an identity match is made on.
+local function roadcPoints(rc)
+	local pts = {}
+	for _, p in pairs(rc.posOf or {}) do pts[#pts + 1] = { p[1], p[2] } end
+	for _, p in pairs(rc.spos or {}) do pts[#pts + 1] = { p[1], p[2] } end
+	return pts
+end
+
+-- {x,y} of each frozen node of a live construction: the template's own street/
+-- track nodes, which the placement proposal added and its ROADC therefore
+-- carries. nil when the entity is gone or its CONSTRUCTION component unreadable.
+local function frozenNodePositions(id)
+	local out
+	pcall(function()
+		if not api.engine.entityExists(id) then return end
+		local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+		if not co then return end
+		-- copy the engine's id list first: the walk below calls back into the
+		-- engine per node, and an engine container is never iterated inline
+		local frozen = {}
+		for _, nid in pairs(co.frozenNodes or {}) do frozen[#frozen + 1] = nid end
+		out = {}
+		for _, nid in ipairs(frozen) do
+			local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
+			local p = nc and nc.position
+			if p then out[#out + 1] = { p.x or p[1], p.y or p[2] } end
+		end
+	end)
+	return out
+end
+
+-- IDENTITY of a street payload and a construction entity: they came out of the
+-- same placement when a node the payload carries IS one of the entity's frozen
+-- nodes -- the same world position, to K.PAIR_NODE_TOL (float print/read slack,
+-- not a search radius: two constructions never own nodes half a metre apart).
+-- Returns how many of the payload's points coincide with a frozen node.
+K.PAIR_NODE_TOL = 0.5
+local function roadcSharesNodes(rc, fpos)
+	if not fpos or #fpos == 0 then return 0 end
+	local tol2 = K.PAIR_NODE_TOL * K.PAIR_NODE_TOL
+	local n = 0
+	for _, p in ipairs(roadcPoints(rc)) do
+		for _, f in ipairs(fpos) do
+			if (p[1] - f[1]) ^ 2 + (p[2] - f[2]) ^ 2 <= tol2 then n = n + 1; break end
+		end
+	end
+	return n
+end
+
+-- Build and ship the CONX for a construction (cn: {file,t,params,name,x,y,id?})
+-- plus its street payload (rc: a parked ROADC). Pairing itself is in
+-- CM.flushConPairs below.
+local function shipConxPair(cn, rc)
+	local sn, se, sr, spz = {}, {}, {}, {}
+	for id, p in pairs(rc.posOf) do
+		sn[#sn + 1] = string.format("%d,%.4f,%.4f,%.4f", id, p[1], p[2], p[3])
+	end
+	for _, e in ipairs(rc.adds) do
+		-- 10 fields: endpoints, tangents, then bridge/tunnel type + typeIndex
+		se[#se + 1] = string.format("%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d", e[1], e[2],
+			e[3][1], e[3][2], e[3][3], e[3][4], e[3][5], e[3][6], e[4] or 0, e[5] or -1)
+	end
+	for _, e in ipairs(rc.rms) do
+		sr[#sr + 1] = string.format("%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f", e[1], e[2],
+			e[3][1], e[3][2], e[3][3], e[3][4], e[3][5], e[3][6])
+	end
+	for id, p in pairs(rc.spos) do
+		spz[#spz + 1] = string.format("%d,%.4f,%.4f,%.4f", id, p[1], p[2], p[3])
+	end
+	local conxCost = nil
+	local base0 = cn.bal0 or rc.bal0   -- pre-build balance (rc covers the rescue path)
+	-- Cancelled placement: nobody has paid yet -- every instance pays the same
+	-- scripted cost at the stamp, so no cost/bal ships and no snap happens.
+	if cn.cancelled then base0 = nil end
+	if base0 then
+		local bnow = CM.cmBalance(api.engine.util.getPlayer())
+		if bnow then conxCost = base0 - bnow end
+	end
+	local conxBal = (not cn.cancelled) and CM.cmBalance(api.engine.util.getPlayer()) or nil  -- absolute post-build balance (canonical coop wallet)
+	log(string.format("con: CONX cost=%s (bal0=%s bal=%s) for %s", tostring(conxCost), tostring(base0), tostring(conxBal), tostring(cn.file)))
+	-- Survivors are gathered again NOW, with the whole extent: the entity's
+	-- bounding box (native build) plus every node the street payload carries --
+	-- the split, the connectors, the apron. The capture-time list (queueConCapture,
+	-- or inject.lua's CONXP parse, which knows no extent) covered less. A failed
+	-- re-gather keeps the earlier list and radius.
+	do
+		local surv, srad = CM.gatherSurvivors(cn.x, cn.y, cn.id, roadcPoints(rc))
+		if srad then cn.survivors, cn.srad = surv, srad end
+	end
+	CM.scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors, srad = cn.srad, cost = conxCost, bal = conxBal, cancelled = cn.cancelled,
+	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
+	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
+	                        etype = rc.etype, stype = rc.stype, ttype = rc.ttype, cat = rc.cat })
+	-- Arm OUR split site too. The orphan-split heal (CM.watchSplit) only knew
+	-- the splits a REPLAY made, so after a demolish the peer healed the split
+	-- and the originator never did: A kept the node and two halves, the peer
+	-- merged them (e1082 vs e1081, 2026-09-02), and the next depot attached to
+	-- that node on A had nothing to attach to on the peers -- fatal. The split
+	-- node is the added node that lies on a removed edge's segment.
+	-- Stamped with the CONX just scheduled (scheduleLocal sets CM.lastSchedAt and
+	-- CM.seqNo), so its check lands on the same sim step as every peer's.
+	local conxStamp = { at = CM.lastSchedAt, origin = K.INSTANCE, seq = CM.seqNo }
+	pcall(function()
+		for _, r in ipairs(rc.rms) do
+			-- a removed-edge record is { node0, node1, tangents[6] }; the endpoint
+			-- POSITIONS are the existing nodes' entries in rc.spos
+			local pa, pb = rc.spos[r[1]], rc.spos[r[2]]
+			if not (pa and pb) then return end
+			local ax, ay, bx, by = pa[1], pa[2], pb[1], pb[2]
+			local vx, vy = bx - ax, by - ay
+			local L2 = vx * vx + vy * vy
+			if L2 > 1 then
+				for _, q in pairs(rc.posOf) do
+					local t = ((q[1] - ax) * vx + (q[2] - ay) * vy) / L2
+					if t > 0.02 and t < 0.98 then
+						local px, py = ax + t * vx, ay + t * vy
+						if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then CM.watchSplit(q[1], q[2], conxStamp) end
+					end
+				end
+			end
+		end
+	end)
+	log(string.format("con: captured %s + street (%d nodes, %d edges, %d removals) -> CONX",
+		cn.file, #sn, #se, #sr))
+end
+
+-- Find the player construction that owns a parked ROADC's tracks, by POSITION,
+-- regardless of knownCons. This rescues the station-over-buildings case, where
+-- the station reuses a demolished building's entity id that is already in
+-- knownCons, so pollNewConstructions never captures it.
+local function findConstructionForRoadc(rc, wholeMap)
+	local pts = roadcPoints(rc)
+	if #pts == 0 then return nil end
+	local cx, cy = 0, 0
+	for _, p in ipairs(pts) do cx = cx + p[1]; cy = cy + p[2] end
+	cx, cy = cx / #pts, cy / #pts
+	-- Search disk: the payload's own extent plus the survivor margin (nothing
+	-- fixed; it was 120 m). The match itself is by identity -- the construction
+	-- whose frozen nodes the payload carries -- so a wider disk cannot mispair.
+	-- wholeMap: the once-only last attempt before the payload is given up on.
+	local radius = wholeMap and 999999 or CM.survivorRadius(cx, cy, nil, pts)
+	local best, bestId, bestN = nil, nil, 0
+	pcall(function()
+		local list = game.interface.getEntities({ pos = { cx, cy }, radius = radius },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		for _, id in pairs(list) do
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			if co and co.fileName and co.transf and CM.isPlayerConstruction(id, tostring(co.fileName)) then
+				local key = CM.conKey(co.transf[13], co.transf[14])
+				-- not one we already track (avoid re-shipping an existing station)
+				if not CM.consByKey[key] then
+					local n = roadcSharesNodes(rc, frozenNodePositions(id))
+					if n > bestN then best, bestId, bestN = co, id, n end
+				end
+			end
+		end
+	end)
+	if not best then return nil end
+	local t = {}
+	for i = 1, 16 do t[i] = string.format("%.4f", best.transf[i]) end
+	local e = game.interface.getEntity(bestId)
+	local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+	local nm = ""
+	pcall(function()
+		local nc = api.engine.getComponent(bestId, api.type.ComponentType.NAME)
+		if nc and nc.name then nm = tostring(nc.name) end
+	end)
+	-- register so the demolish/edit trackers see it, and so we do not re-ship it
+	local key = CM.conKey(best.transf[13], best.transf[14])
+	knownCons[bestId] = true
+	noteCon(bestId, tostring(best.fileName), key, pstr)
+	local surv, srad = CM.gatherSurvivors(best.transf[13], best.transf[14], bestId, pts)
+	return { file = tostring(best.fileName), t = table.concat(t, ","), params = pstr,
+	         name = CM.escName(nm), x = best.transf[13], y = best.transf[14], id = bestId,
+	         survivors = surv, srad = srad }
+end
+
+-- Pair each captured construction with the street payload the slice shipped for
+-- the SAME placement and ship ONE command (CONX); a construction with no payload
+-- ships as CONP. Pairing is by IDENTITY, never by distance. Until 2026-09-16 a
+-- construction took the nearest ROADC within 150 m and a payload nothing claimed
+-- inside 15 units was thrown away ("street payload dropped"), so a big station
+-- -- whose origin sits further than 150 m from its road mouth -- shipped as CONP
+-- and the peers built it without its street. Now:
+--   * a NATIVE build (the record carries its entity id): the payload's nodes ARE
+--     the entity's frozen nodes, at the same world positions (roadcSharesNodes);
+--   * a CANCELLED placement (CONXP, no entity): the slice stamps ONE placement
+--     serial on the ROADC (ps=) and on the CONXP (ps= rc=) of the same
+--     placement, so the payload is the parked record with that serial -- however
+--     many polls, stalls or other placements lie between the two reads. rc=1 says
+--     a ROADC was written for it: if none with that serial is parked the line was
+--     unreadable or lost, and the placement is REFUSED loudly rather than built
+--     on every instance without its street; rc=0 is a free-standing placement,
+--     which ships as CONP at once. A record with no serial (a slice older than
+--     2026-09-16) falls back to arrival order: the ROADC parked right before it,
+--     at most one poll apart.
+-- The ROADC always precedes its construction in the inject stream (factory hook
+-- first, then the cancel or the build). A payload no construction claims is
+-- retried against the world (findConstructionForRoadc, the id-reuse case) and,
+-- after K.ROADC_ORPHAN_UNITS, searched for once more over the whole map before it
+-- is declared a DIVERGENCE in the log -- never dropped in silence. One payload
+-- IS released without a search: the one whose CONXP inject.lua dropped whole
+-- (actions off, far behind: the cancel landed, so that placement happened on no
+-- game and there is nothing to pair or to diverge from).
+K.ROADC_ORPHAN_UNITS = 15
+K.ROADC_RESCUE_EVERY = 5     -- ticks between local rescue searches for an unclaimed payload
+function CM.flushConPairs()
+	local now = CM.gameTime()
+	if not now then return end
+	for ci = #CM.pendingCons, 1, -1 do
+		local cn = CM.pendingCons[ci]
+		local best, why, refuse
+		if cn.id then
+			local fpos = frozenNodePositions(cn.id)
+			local bestN = 0
+			for ri, rc in ipairs(CM.pendingRoadc) do
+				local n = roadcSharesNodes(rc, fpos)
+				if n > bestN then best, bestN = ri, n end
+			end
+			if best then
+				why = string.format("payload shares %d node(s) with the entity's %d frozen node(s)", bestN, #fpos)
+			else
+				why = string.format("%s frozen node(s) on entity %d, %d payload(s) parked, none shares a node",
+					fpos and tostring(#fpos) or "unreadable", cn.id, #CM.pendingRoadc)
+			end
+		elseif tonumber(cn.cancelled or 0) == 1 and cn.ps then
+			-- IDENTITY: the same placement serial on both records
+			for ri, rc in ipairs(CM.pendingRoadc) do
+				if rc.ps == cn.ps then best = ri; break end
+			end
+			if best then
+				why = string.format("same placement serial ps=%d", cn.ps)
+			elseif tonumber(cn.hadRoadc or 0) == 1 then
+				refuse = string.format("the slice shipped a street payload for ps=%d and none is parked (%d parked) -- look for 'bad ROADC line' above",
+					cn.ps, #CM.pendingRoadc)
+			else
+				why = string.format("free-standing, the slice shipped no street payload (ps=%d rc=0)", cn.ps)
+			end
+		elseif tonumber(cn.cancelled or 0) == 1 then
+			-- no serial on the record (a slice older than 2026-09-16): the ROADC
+			-- parked right before this CONXP -- the newest one older than it,
+			-- unless a CONXP already sits between the two
+			local prevOrd = 0
+			for _, o in ipairs(CM.pendingCons) do
+				if o ~= cn and tonumber(o.cancelled or 0) == 1 and (o.ord or 0) < (cn.ord or 0) and (o.ord or 0) > prevOrd then
+					prevOrd = o.ord
+				end
+			end
+			local cand, candI
+			for ri, rc in ipairs(CM.pendingRoadc) do
+				if (rc.ord or 0) > prevOrd and (rc.ord or 0) < (cn.ord or 0) and (not cand or (rc.ord or 0) > (cand.ord or 0)) then
+					cand, candI = rc, ri
+				end
+			end
+			if cand and (cn.tick or 0) - (cand.tick or 0) <= 1 then
+				best = candI
+				why = string.format("the ROADC parked right before it (ord %s/%s, same poll)", tostring(cand.ord), tostring(cn.ord))
+			elseif cand then
+				why = string.format("the ROADC parked before it is %d tick(s) older -- a build whose cancel did not land, not this placement",
+					(cn.tick or 0) - (cand.tick or 0))
+			else
+				why = string.format("no ROADC parked between the previous CONXP and this one (%d parked)", #CM.pendingRoadc)
+			end
+		else
+			why = "record has neither an entity id nor cancelled=1"
+		end
+		table.remove(CM.pendingCons, ci)
+		if refuse then
+			-- Nothing is shipped: the cancel landed here, so the placement happened
+			-- on no game. Shipping the construction alone would build it on every
+			-- instance WITHOUT its street, which is worse than a lost click.
+			log(string.format("CONXP: REFUSED -- %s at (%.1f,%.1f) is NOT built anywhere: %s; place it again",
+				cn.file, cn.x or 0, cn.y or 0, refuse))
+		elseif best then
+			local rc = table.remove(CM.pendingRoadc, best)
+			log(string.format("con: %s paired with its street payload: %s", cn.file, why))
+			shipConxPair(cn, rc)
+		else
+			-- Free-standing: the extent is the entity's bounding box (native build)
+			-- or the origin alone (cancelled placement, nothing built yet).
+			local surv, srad = CM.gatherSurvivors(cn.x, cn.y, cn.id, nil)
+			if srad then cn.survivors, cn.srad = surv, srad end
+			-- cancelled=1 rides along: a free-standing placement the slice cancelled
+			-- must be built by the scripted proposal on the originator too, not
+			-- bulldozed and rebuilt (the flag used to be dropped here)
+			CM.scheduleLocal("CONP", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, cancelled = cn.cancelled,
+			                        survivors = cn.survivors, srad = cn.srad })
+			log(string.format("con: captured %s (free-standing%s) -> CONP; no street payload: %s", cn.file,
+				tonumber(cn.cancelled or 0) == 1 and ", cancelled" or "", why))
+		end
+	end
+	for ri = #CM.pendingRoadc, 1, -1 do
+		local rc = CM.pendingRoadc[ri]
+		local age = now - rc.at
+		if rc.ps and CM.droppedConxp[rc.ps] then
+			-- its placement was dropped whole (actions off): the cancel landed, so
+			-- it happened on no game -- nothing to pair with, nothing to diverge from
+			CM.droppedConxp[rc.ps] = nil
+			table.remove(CM.pendingRoadc, ri)
+			log(string.format("ROADC: released -- its placement ps=%d was dropped (actions off, far behind), so it was built on no game", rc.ps))
+		elseif age > K.ROADC_ORPHAN_UNITS then
+			-- Last chance, once, over the whole map: the id-reuse case where the
+			-- entity's origin sits outside the local search disk.
+			table.remove(CM.pendingRoadc, ri)
+			local cn = findConstructionForRoadc(rc, true)
+			if cn then
+				log(string.format("con: ROADC rescued its construction %s by identity in a whole-map search (id-reuse case)", cn.file))
+				shipConxPair(cn, rc)
+			else
+				local peers = 0
+				pcall(function() peers = CM.livePeers() end)
+				local n = 0
+				for _ in pairs(rc.posOf or {}) do n = n + 1 end
+				log(string.format("ROADC: DIVERGENCE -- no construction claimed this street payload in %.1f units (%d nodes, %d edges, %d removals, parked tick %s)%s",
+					age, n, #(rc.adds or {}), #(rc.rms or {}), tostring(rc.tick),
+					peers > 0 and "; if its construction shipped as CONP the peers built it WITHOUT this street -- report this line"
+							  or "; no live peer, nothing to diverge from"))
+			end
+		elseif age > 1.0 and (CM.ticks or 0) % K.ROADC_RESCUE_EVERY == 0 then
+			-- Active rescue: a ROADC that has waited a beat without a pollNewConstructions
+			-- capture (id reuse) -- look for the entity whose frozen nodes it carries.
+			local cn = findConstructionForRoadc(rc, false)
+			if cn then
+				table.remove(CM.pendingRoadc, ri)
+				log(string.format("con: ROADC rescued its construction %s by identity (id-reuse case)", cn.file))
+				shipConxPair(cn, rc)
+			end
+		end
+	end
+end
+
+-- Balance as of the previous construction poll. A player's native build lands
+-- between two polls, so this is the balance BEFORE it -- the only way to learn
+-- what the native copy cost, which the strict reconciliation needs (the scripted
+-- rebuild costs a DIFFERENT amount: it grades the terrain differently, measured
+-- 16054 more on one depot).
+CM.balPrevConPoll = nil
+CM.conBal0 = {}          -- conKey -> balance before that construction was built
+-- ---------- replays land by lookup, not by scanning the world ----------
+-- Nothing polls the whole world for new constructions on a timer any more: on a big
+-- map that scan froze the simulation ~300 ms every 10 sim steps (2026-09-12). What it
+-- used to find is already announced:
+--   * a player's own placement / upgrade / demolish: the slice's CONXP, ROADC, CONUP
+--     and CDEMO lines (a build it had to leave native says NATIVE, and a catch-up
+--     scan runs once -- see update() in lockstep.lua);
+--   * a construction our own replay builds (CONX, CONP, CONU): expectedCons or
+--     expectedEdit holds its POSITION, so a lookup at that spot finds it.
+-- landReplayed is the one place a landed replay is registered and, in companies
+-- mode, handed to the company that built it.
+K.LAND_TIMEOUT_TICKS = 600   -- ~2 min: a replay that never lands stops holding its flag
+CM.expectedSince = {}        -- key -> the tick a lookup first waited for it
+
+local function landReplayed(id, fn, key, pstr)
+	if CM.expectedCons[key] then
+		CM.expectedCons[key] = nil
+		CM.expectedSince[key] = nil
+		noteCon(id, fn, key, pstr)
+		log(string.format("con: replayed %s landed as id %d", fn, id))
+		-- companies mode: the replay landed owned by our local player; hand it to the
+		-- ORIGIN company and lock it. Done here, not in a build callback, because every
+		-- replay path -- buildProposal AND the buildConstruction fallback -- lands here.
+		local ocid = CM.cmExpectedCompany[key]
+		if ocid then
+			CM.cmExpectedCompany[key] = nil
+			pcall(function() CM.cmReassignConstruction(id, ocid) end)
+			-- R2: the build was charged to OUR wallet; the balance drop since apply is
+			-- the exact cost -> move it to co<ocid>.
+			local bal0 = CM.cmExpectedBal0[key]; CM.cmExpectedBal0[key] = nil
+			local nowBal = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
+			if bal0 and nowBal then pcall(function() CM.cmTransferCost(ocid, bal0 - nowBal, "CON " .. fn) end) end
+		end
+		return true
+	elseif expectedEdit[key] then
+		expectedEdit[key] = nil
+		CM.expectedSince[key] = nil
+		noteCon(id, fn, key, pstr)
+		log(string.format("con: replayed edit landed as id %d", id))
+		-- the replacement landed owned by our player: back to the company that owned it
+		local oc = CM.expectedEditOwner[key]
+		CM.expectedEditOwner[key] = nil
+		if oc and oc ~= CM.cmMyCompany then pcall(function() CM.cmReassignConstruction(id, oc) end) end
+		return true
+	end
+	return false
+end
+
+-- Every 3 ticks while a replay is expected (nothing to do otherwise): look at each
+-- expected position for a player construction that is not known yet -- a NEW id, so
+-- an edit's still-standing old entity is skipped until its replacement appears. A
+-- key that never lands is let go after K.LAND_TIMEOUT_TICKS: a stale flag also holds
+-- back the demolish tracker (pollConstructionRemovals).
+function CM.landReplays()
+	if CM.ticks % 3 ~= 2 then return end
+	for key in pairs(CM.expectedSince) do
+		if not CM.expectedCons[key] and not expectedEdit[key] then CM.expectedSince[key] = nil end
+	end
+	local keys = {}
+	for key in pairs(CM.expectedCons) do keys[#keys + 1] = key end
+	for key in pairs(expectedEdit) do if not CM.expectedCons[key] then keys[#keys + 1] = key end end
+	for _, key in ipairs(keys) do
+		CM.expectedSince[key] = CM.expectedSince[key] or CM.ticks
+		local kx, ky = tostring(key):match("^([-%d.]+)/([-%d.]+)$")
+		local x, y = tonumber(kx), tonumber(ky)
+		local landed = false
+		if x and y then
+			pcall(function()
+				local list = game.interface.getEntities({ pos = { x, y }, radius = 5 },
+					{ type = "CONSTRUCTION", includeData = false }) or {}
+				for _, id in pairs(list) do
+					if not knownCons[id] then
+						local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+						local fn = co and co.fileName and tostring(co.fileName)
+						if fn and co.transf and CM.conKey(co.transf[13], co.transf[14]) == key
+						   and CM.isPlayerConstruction(id, fn) then
+							local e = game.interface.getEntity(id)
+							local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+							knownCons[id] = true
+							landed = landReplayed(id, fn, key, pstr)
+							if landed then return end
+						end
+					end
+				end
+			end)
+		end
+		if not landed and CM.ticks - CM.expectedSince[key] > K.LAND_TIMEOUT_TICKS then
+			CM.expectedCons[key] = nil
+			expectedEdit[key] = nil
+			CM.expectedSince[key] = nil
+			log(string.format("con: the replay expected at %s never landed within %d ticks -- flag dropped",
+				key, K.LAND_TIMEOUT_TICKS))
+		end
+	end
+end
+
+function CM.pollNewConstructions()
+	local balAtEntry = nil
+	pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then balAtEntry = tonumber(e.balance) end end)
+	local ok, err = pcall(function()
+		local list = game.interface.getEntities({ radius = 999999 },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		if not CM.consPrimed then
+			-- Existing constructions get classified a few per tick, so a station
+			-- that was in the save can still have its EDITS replicated, without
+			-- thousands of component reads in one frame.
+			for _, id in pairs(list) do knownCons[id] = true; CM.primeQueue[#CM.primeQueue + 1] = id end
+			CM.consPrimed = true
+			return
+		end
+		for _, id in pairs(list) do
+			if not knownCons[id] then
+				-- A player-buildable construction (station/depot/...) can appear a
+				-- tick or two BEFORE its PLAYER_OWNED component is assigned --
+				-- notably when it is placed OVER buildings, whose demolish delays
+				-- ownership. Marking it known immediately would classify it as a
+				-- town building forever (the station-over-buildings replication
+				-- bug). So for a buildable file with ownership still nil, DON'T
+				-- mark it known -- retry (bounded) until owned.
+				local co0 = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				local fn0 = co0 and co0.fileName and tostring(co0.fileName) or ""
+				local buildable = false
+				for _, p in ipairs({ "station/", "depot/", "asset/", "airport/", "harbor/", "harbour/" }) do
+					if fn0:sub(1, #p) == p then buildable = true; break end
+				end
+				local ownedComp = nil
+				pcall(function() ownedComp = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED) end)
+				local waitOwnership = false
+				if buildable and ownedComp == nil then
+					ownershipPending[id] = (ownershipPending[id] or 0) + 1
+					waitOwnership = ownershipPending[id] < 30   -- retry next poll (bounded)
+				end
+				if buildable then
+					log(string.format("con DEBUG: buildable id=%d file=%s owned=%s isPlayer=%s wait=%s",
+						id, fn0, tostring(ownedComp ~= nil),
+						tostring(CM.isPlayerConstruction(id, fn0)), tostring(waitOwnership)))
+				end
+				if not waitOwnership then
+				ownershipPending[id] = nil
+				knownCons[id] = true
+				local alive = false
+				pcall(function() alive = api.engine.entityExists(id) end)
+				if alive then
+					local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+					if co and co.fileName and co.transf and CM.isPlayerConstruction(id, tostring(co.fileName)) then
+						local fn = tostring(co.fileName)
+						local key = CM.conKey(co.transf[13], co.transf[14])
+						local e = game.interface.getEntity(id)
+						local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+						if landReplayed(id, fn, key, pstr) then
+							-- our own replay or replayed edit landed (registered, handed over)
+						elseif CM.consByKey[key] and CM.consByKey[key].file == fn then
+							-- Same spot, new id: the entity was REPLACED, which is
+							-- what an upgrade does. An edit, not a build.
+							log(string.format("con DEBUG: %s id=%d treated as EDIT (consByKey had this spot)", fn, id))
+							local prev = noteCon(id, fn, key, pstr)
+							if prev.params ~= pstr then shipEdit(fn, key, pstr) end
+						else
+							noteCon(id, fn, key, pstr)
+							queueConCapture(fn, key, pstr, co.transf, id)
+							log(string.format("con: captured %s id=%d params=%dB -- pairing", fn, id, #pstr))
+						end
+					end
+				end
+				end   -- close: if not waitOwnership
+			end
+		end
+	end)
+	if not ok then log("con poll error: " .. tostring(err)) end
+	if balAtEntry then CM.balPrevConPoll = balAtEntry end
+end
+
+-- Classify a slice of the primed ids each tick.
+function CM.primeConstructions()
+	if #CM.primeQueue == 0 then return end
+	local ok, err = pcall(function()
+		local n = 0
+		while #CM.primeQueue > 0 and n < K.PRIME_PER_TICK do
+			local id = table.remove(CM.primeQueue)
+			n = n + 1
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(id) end)
+			if alive then
+				local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				if co and co.fileName and co.transf and CM.isPlayerConstruction(id, tostring(co.fileName)) then
+					local e = game.interface.getEntity(id)
+					noteCon(id, tostring(co.fileName), CM.conKey(co.transf[13], co.transf[14]),
+						(e and e.params) and CM.ser(e.params) or "{}")
+				end
+			end
+		end
+		if #CM.primeQueue == 0 then
+			local c = 0; for _ in pairs(CM.consByKey) do c = c + 1 end
+			log("con: primed " .. c .. " player construction(s) for edit tracking")
+		end
+	end)
+	if not ok then log("con prime error: " .. tostring(err)) end
+end
+
+-- In-place edits: params changed on an id we already know. Only player
+-- constructions are in consByKey, so this walks a handful of entities.
+-- conKey -> tick first seen dead. A construction that is gone for two
+-- consecutive scans (and not replaced at the same spot) was DEMOLISHED; a
+-- one-scan gap is the window of an UPGRADE (old entity removed, new one about
+-- to appear), which pollNewConstructions handles as an edit.
+-- Fast demolish detector. A tracked construction that is gone is either
+-- DEMOLISHED or UPGRADED (removed and re-created at the same spot). Instead of
+-- waiting out a long debounce, ASK: is there still a construction at that
+-- position? If yes it was an upgrade (pollNewConstructions re-adopts it as an
+-- edit) -- skip. If no, it is a demolish -- but require TWO consecutive misses
+-- a few ticks apart so a one-frame remove/re-add gap is not read as a demolish.
+local demolishMiss = {}   -- conKey -> consecutive scans seen gone-with-nothing-there
+K.REMOVAL_POLL_EVERY = 3
+
+-- Is a PLAYER construction still standing here? Used to tell an upgrade (the
+-- old entity vanishes, a new one appears in its place) from a demolish (nothing
+-- replaces it).
+--
+-- PLAYER-owned only, and that is the whole point. Town buildings are
+-- CONSTRUCTION entities too, and a truck station sits in a town surrounded by
+-- them -- so with a bare type filter, demolishing one found a house within 6 m,
+-- called it an upgrade, and never shipped the DEMOLISH. The peer kept the
+-- station forever. Measured 2026-08-31 in a live game: the host's world had 8
+-- player constructions to the joiner's 7, seq 1..51 arrived from the joiner with
+-- no gaps and not one DEMOLISH among them -- nothing was lost in flight, the
+-- detector simply never fired.
+function CM.constructionAt(x, y, maxDist)
+	local found
+	pcall(function()
+		local list = game.interface.getEntities({ pos = { x, y }, radius = maxDist or 6 },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		for _, id in pairs(list) do
+			if not found then
+				local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				local fn = co and co.fileName and tostring(co.fileName) or ""
+				if CM.isPlayerConstruction(id, fn) then found = id end
+			end
+		end
+	end)
+	return found
+end
+
+-- One tracked construction, checked for a demolish. Two consecutive misses a few ticks
+-- apart make a demolish, so a one-frame remove/re-add gap is not read as one.
+local function removalCheck(key, rec)
+	if conStillThere(rec) then
+		demolishMiss[key] = nil
+	else
+		local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
+		local x, y = tonumber(kx), tonumber(ky)
+		-- An upgrade replacement stands ON the spot (the key is rounded to
+		-- 0.1 m); a neighbour 6 m away is not it -- a bulldozed fence
+		-- segment's record lived on because the next segment was in reach.
+		if x and CM.constructionAt(x, y, 1) then
+			-- something is still there: an upgrade replacement; let
+			-- pollNewConstructions re-adopt it. Not a demolish.
+			demolishMiss[key] = nil
+		else
+			demolishMiss[key] = (demolishMiss[key] or 0) + 1
+			if demolishMiss[key] >= 2 then
+				demolishMiss[key] = nil
+				if expectedEdit[key] or CM.expectedCons[key] then
+					-- upgrade/replay in flight -- but a STALE flag here
+					-- silently suppresses a real demolish forever
+					-- (suspected one-off 2026-08-29: bulldoze logged by
+					-- the hook, mod said nothing). Tripwire it.
+					log(string.format("con: %s is gone but edit/replay flags block the demolish (edit=%s cons=%s) -- will re-check",
+						key, tostring(expectedEdit[key] ~= nil), tostring(CM.expectedCons[key] ~= nil)))
+				elseif CM.expectedDemolish[key] then
+					CM.expectedDemolish[key] = nil
+					CM.consByKey[key] = nil
+					log(string.format("con: %s bulldozed by replay -- not echoed", key))
+				else
+					CM.consByKey[key] = nil
+					if x and y then
+						-- no re-arm here: execDemolish re-arms on every instance at the
+						-- DEMOLISH's stamp (the originator's skip path included)
+						CM.scheduleLocal("DEMOLISH", { x = x, y = y })
+						log(string.format("con: DEMOLISH captured at %.1f,%.1f (%s)", x, y, tostring(rec.file)))
+					else
+						log("con: a construction vanished but its position is unknown (key=" .. tostring(key) .. ")")
+					end
+				end
+			end
+		end
+	end
+end
+
+-- One tracked construction, checked for an in-place edit: the safety net for a
+-- change the slice did not capture (its CONUP covers a player's module edits).
+local function editCheck(key, rec)
+	if conStillThere(rec) then
+		local e = game.interface.getEntity(rec.id)
+		local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+		if pstr ~= rec.params then
+			local foreign, fcid = false, nil
+			if not expectedEdit[key] and CM.cmMode == "companies" and CM.cmForeignOwner then
+				foreign, fcid = CM.cmForeignOwner(rec.id)
+			end
+			if expectedEdit[key] then
+				rec.params = pstr
+				expectedEdit[key] = nil      -- our own replay changed it in place
+			elseif foreign then
+				-- ANOTHER COMPANY'S BUILDING, changed here (2026-09-27: a
+				-- headquarters' window upgraded a foreign HQ). Every other machine
+				-- would refuse the edit (execConU), so it does not ship: it is
+				-- undone here, back to the params everyone else still has.
+				local old = CM.deserParams(rec.params)
+				if old then
+					old.seed = nil
+					expectedEdit[key] = true
+					CM.expectedEditOwner[key] = fcid
+					local rok = pcall(game.interface.upgradeConstruction, rec.id, rec.file, old)
+					if not rok then expectedEdit[key] = nil; CM.expectedEditOwner[key] = nil end
+					log(string.format("con: edit of %s at %s belongs to company %s -- undone here, not shipped (ok=%s)", rec.file, key, tostring(fcid), tostring(rok)))
+				end
+				if CM.cmNote then CM.cmNote("that building belongs to " .. (fcid and CM.cmNameOf(fcid) or "another company") .. ": your change was undone") end
+			else
+				rec.params = pstr
+				shipEdit(rec.file, key, pstr)
+			end
+		end
+	end
+end
+
+-- Every tracked construction at once (a catch-up, and the offline tests).
+function CM.pollConstructionRemovals()
+	local ok, err = pcall(function()
+		for key, rec in pairs(CM.consByKey) do removalCheck(key, rec) end
+	end)
+	if not ok then log("con removal poll error: " .. tostring(err)) end
+end
+
+function CM.scanConstructionEdits()
+	local ok, err = pcall(function()
+		for key, rec in pairs(CM.consByKey) do editCheck(key, rec) end
+	end)
+	if not ok then log("con edit scan error: " .. tostring(err)) end
+end
+
+-- SPREAD OVER THEIR CYCLE (2026-09-23). update() ran each check over EVERY
+-- tracked construction in one tick: on a live 409-construction map the edit scan
+-- (an entity read and a params serialization each) froze the simulation for
+-- ~525 ms every 30 ticks, and the removal poll took ~21 ms every 3rd tick --
+-- 23 of the update's 24 ms on average (PERF lanes, 2026-09-24). Now a cycle
+-- takes a snapshot of the keys and works through ceil(n / every) of them per
+-- tick, so every construction is still checked once per cycle of the same
+-- length -- the same checks, the same cadence per construction, in slices. A
+-- construction added mid-cycle joins the next one; one removed is skipped; a
+-- record replaced under its key is checked as it is now. Each check has its own
+-- pcall, so one unreadable construction no longer ends the pass for the rest.
+local function sliced(every, check, what)
+	local cycle, pos, per = {}, 1, 0
+	return function()
+		if pos > #cycle then
+			cycle, pos = {}, 1
+			for key in pairs(CM.consByKey) do cycle[#cycle + 1] = key end
+			table.sort(cycle)
+			per = math.ceil(#cycle / every)
+		end
+		local stop = math.min(#cycle, pos + per - 1)
+		local from = pos
+		pos = stop + 1
+		for i = from, stop do
+			local key = cycle[i]
+			local rec = CM.consByKey[key]
+			if rec then
+				local ok, err = pcall(check, key, rec)
+				if not ok then log("con " .. what .. " error at " .. tostring(key) .. ": " .. tostring(err)) end
+			end
+		end
+	end
+end
+CM.pollConstructionRemovalsSlice = sliced(K.REMOVAL_POLL_EVERY, removalCheck, "removal poll")
+CM.scanConstructionEditsSlice = sliced(K.CON_EDIT_SCAN_EVERY, editCheck, "edit scan")
+end

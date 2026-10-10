@@ -1,0 +1,192 @@
+# Builds TpF2Multiplayer.msi and the Proton/manual-install files zip the way a
+# release does: installer\build_msi.ps1 (native DLLs, the frozen lobby, the
+# custom-action DLL, wix build, then an administrative-install validation), then
+# tools\build_files_zip.py. A push to main, a v* tag or a manual run gets the
+# artifacts; a v* tag also gets a draft GitHub release with its notes, which
+# tools/publish_release.py completes: this release carries the two launchers, the
+# install files go to the packages repository (silver2127/tpf2-multiplayer-packages,
+# same tag) and to a release tagged without the "v". Nothing builds on dev or pull
+# requests: the tests run locally, the MSI is for releases.
+#
+# The runner's Visual Studio is found through vswhere (tools\msvc_env.bat), so no
+# Build Tools path is assumed. WiX v7 is installed as a .NET global tool; passing
+# -AcceptWixEula means the repository owner accepts the WiX Open Source
+# Maintenance Fee terms (https://wixtoolset.org/osmf/) for CI builds.
+name: Build MSI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # docs and every Markdown file, release notes included, change no byte of the
+    # package. A release commit always touches installer/VERSION, so a tag is
+    # never filtered out by this.
+    paths-ignore: ['docs/**', '**/*.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # release upload on tags; read-only is enough for everything else
+
+concurrency:
+  group: msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ONE BUILD PER RELEASE. A release is a tag on a commit that main is then
+  # fast-forwarded to; both pushes would build the same bytes. The tag goes up
+  # first (tools/ci_run.py, the release recipe), so a main push finds its tag's
+  # run here and steps aside. A main push nobody tagged still builds.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.dup.outputs.skip }}
+    steps:
+      - id: dup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip=false
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tag=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=30" \
+              --jq '[.workflow_runs[] | select(.event == "push" and (.head_branch | startswith("v")) and (.id != ${{ github.run_id }}))] | .[0].head_branch // empty')
+            if [ -n "$tag" ]; then skip=true; echo "commit ${{ github.sha }} is release $tag: its tag run builds it"; fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  msi:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: netpunch/requirements.txt
+
+      - name: Python packages (lobby freeze)
+        # PyInstaller with its bootloader compiled here, not the stock stub every
+        # antivirus signature knows (tools/pyinstaller_from_source.py)
+        run: |
+          python tools\pyinstaller_from_source.py
+          pip install -r netpunch\requirements.txt
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: WiX Toolset v7
+        run: |
+          dotnet tool install --global wix
+          wix --version
+
+      - name: Steam Messages adapter regression
+        run: python tools\steam_messages_test.py
+
+      - name: TCP connectivity regression
+        run: |
+          python tools\test_tcp_connectivity.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools\test_transfer_status.py
+
+      - name: OPEN LOGS archive regression
+        shell: cmd
+        run: |
+          call tools\msvc_env.bat || exit /b 1
+          cl /nologo /std:c++17 /EHsc /I native\src tools\logarchive_test.cpp advapi32.lib /Fe:%RUNNER_TEMP%\logarchive_test.exe /Fo:%RUNNER_TEMP%\logarchive_test.obj || exit /b 1
+          %RUNNER_TEMP%\logarchive_test.exe
+
+      - name: Build the MSI
+        run: powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate
+
+      - name: Build the files zip (Proton / manual install)
+        run: python tools\build_files_zip.py
+
+      - name: Build the dedicated server package (Linux)
+        run: python tools\server\build_package.py
+
+      - name: Checksums
+        shell: pwsh
+        working-directory: installer/out
+        run: |
+          # LF line endings: sha256sum -c and the shell installer read "<hash>  <name>" lines,
+          # and a trailing \r (Set-Content's default on Windows) broke the 0.6.1.12 install
+          $sums = Get-FileHash TpF2Multiplayer.msi, TpF2Multiplayer-files.zip, TpF2Multiplayer-Server-Linux.tar.gz -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) SHA256SUMS.txt), ($sums -join "`n") + "`n", (New-Object Text.ASCIIEncoding))
+          Get-Content SHA256SUMS.txt
+          # the Proton installers, pinned to this release when the run is a tag
+          $ver = if ('${{ github.ref }}' -like 'refs/tags/v*') { '${{ github.ref_name }}'.Substring(1) } else { '' }
+          $utf8 = New-Object Text.UTF8Encoding $false
+          $py = [IO.File]::ReadAllText((Resolve-Path ..\..\tools\proton\install.py))
+          if ($ver) { $py = $py -replace 'DEFAULT_VERSION = None', "DEFAULT_VERSION = `"$ver`"" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) install_proton.py), $py, $utf8)
+          $sh = [IO.File]::ReadAllText((Resolve-Path ..\..\tools\proton\install_proton.sh))
+          if ($ver) { $sh = $sh -replace 'DEFAULT_VERSION=""', "DEFAULT_VERSION=`"$ver`"" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) install_proton.sh), $sh.Replace("`r`n", "`n"), $utf8)
+
+      - name: Release notes (the Download table first, then installer/RELEASE-<version>.md)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $ver = $tag.Substring(1)
+          # This release shows the two launchers (tools/publish_release.py attaches them under
+          # these names); the install files go to silver2127/tpf2-multiplayer-packages, same tag,
+          # and to the release <version> tagged without the "v".
+          $base = 'https://github.com/${{ github.repository }}/releases/download/' + $tag
+          $pkg = 'https://github.com/silver2127/tpf2-multiplayer-packages/releases/tag/' + $tag
+          $body = @"
+          ## Download
+
+          | You play on | Get this one file |
+          | --- | --- |
+          | **Windows** (Steam, game build 35924) | **[TpF2Multiplayer-Launcher-Windows-Setup.exe]($base/TpF2Multiplayer-Launcher-Windows-Setup.exe)** -- install it, then **Update & play** |
+          | **Linux / Steam Deck** (the native game or Proton) | **[TpF2Multiplayer-Launcher-Linux.AppImage]($base/TpF2Multiplayer-Launcher-Linux.AppImage)** -- make it executable, run it, then **Update & play** |
+
+          The launcher installs this version and keeps it up to date. Or install this version directly:
+
+          | You play on | Get this one file |
+          | --- | --- |
+          | **Windows** | [TpF2Multiplayer.msi]($base/TpF2Multiplayer.msi) -- close the game, run it |
+          | **Linux / Steam Deck**, the Windows game under Proton | [install_proton.sh]($base/install_proton.sh) -- run it with sh; it fetches the rest itself |
+          | **Linux**, the native game | [tpf2mp-linux-$ver-native.run]($base/tpf2mp-linux-$ver-native.run) -- close the game, ``bash tpf2mp-linux-$ver-native.run`` |
+          | **A dedicated server** on Linux or a VPS | [TpF2Multiplayer-Server-Linux.tar.gz]($base/TpF2Multiplayer-Server-Linux.tar.gz) -- unpack it, ``sudo sh tpf2mp-server/setup_vps.sh``; the guide: [HOSTING_A_SERVER.md](https://github.com/${{ github.repository }}/blob/main/docs/HOSTING_A_SERVER.md). A Windows server is the MSI above |
+
+          The files zip, the Linux .tar.gz, install_proton.py and the checksums are in the [packages for $tag]($pkg). The two *Source code* archives at the bottom are the repository, not the mod. Everyone in a session needs the same version.
+
+          "@
+          $notes = "installer/RELEASE-$ver.md"
+          if (Test-Path $notes) {
+            $text = [IO.File]::ReadAllText((Resolve-Path $notes))
+            if ($text.StartsWith('## EXPERIMENTAL')) { $body = $text }
+            else { $body += "`n" + $text }
+          } else { Write-Host "no $notes -- the generated notes follow the table" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'installer/out/release_body.md'), $body.Replace("`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+          Get-Content installer/out/release_body.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TpF2Multiplayer-${{ github.sha }}
+          path: |
+            installer/out/TpF2Multiplayer.msi
+            installer/out/TpF2Multiplayer-files.zip
+            installer/out/TpF2Multiplayer-Server-Linux.tar.gz
+            installer/out/install_proton.py
+            installer/out/install_proton.sh
+            installer/out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      # A draft with the notes only: tools/publish_release.py puts the files above (this
+      # run's artifact) and the native Linux package into the packages repository and the
+      # <version> release, attaches the two launchers here and publishes both.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: installer/out/release_body.md
+          draft: true
+          generate_release_notes: true

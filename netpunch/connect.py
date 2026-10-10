@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+connect.py -- code exchange, the connect race, and the C++-facing CLI (Phase 3)
+plus named failure diagnosis (Phase 4).
+
+This is THE interface the Transport Fever 2 mod menu drives. Two friends each
+run one command and paste a short base32 code to each other over Discord:
+
+    python connect.py host            -> prints CODE=..., waits for the joiner
+    python connect.py join <CODE>     -> prints its own CODE=..., dials the host
+
+Both write machine-readable progress to ``netpunch_status.txt`` (JSON lines):
+    {"state":"waiting"}
+    {"state":"connected","peer":"1.2.3.4:29471"}   (or)
+    {"state":"failed","reason":"..."}
+Exit code is 0 on connect, non-zero on failure. Only the single ``CODE=`` line
+goes to stdout; all diagnostics go to stderr so the caller can parse cleanly.
+
+------------------------------------------------------------------------------
+Code format (base32 of a compact binary blob, ~45-55 chars)
+------------------------------------------------------------------------------
+    byte 0   bitfield:
+             0x01 flag open        0x08 present lan_v4
+             0x02 flag symmetric   0x10 present public_v4
+             0x04 flag cgnat       0x20 present v6
+                                   0x40 v6 is 6to4 derived from public_v4
+    byte 1-4 uint32 BE unix timestamp (for the >10-min staleness warning)
+    [lan_v4]     4-byte IPv4 + 2-byte port   (if present)
+    [public_v4]  4-byte IPv4 + 2-byte port   (if present)
+    [v6]         2-byte port + (10 bytes low-order if 6to4-derived else 16 bytes)
+The 6to4 trick: a 2002:VVVV:VVVV:... address embeds the public IPv4 in its top
+48 bits, so when public_v4 is also present we ship only the low 80 bits.
+    [vpn_v4]     4-byte IPv4 + 2-byte port, TRAILING (after every flagged field
+    [vpn2_v4]    and the secret): the host's VPN adapters (Hamachi 25/8 first,
+                 then Tailscale 100.64/10, or TPF2MP_VPN_IP). Every flag bit is
+                 taken, so these ride as a 6- or 12-byte tail; readers from
+                 before it ignore the tail.
+    [steam]      8-byte SteamID64, LAST (after the VPN fields): the host's
+                 Steam identity, dialled through the Steam tunnel
+                 (steamtunnel.py) as one more candidate. A tail of 8, 14 or
+                 20 bytes ends with it; 6 or 12 is VPN only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import socket
+import struct
+import sys
+import threading
+import time
+
+from punch import DEFAULT_PORT, Connection, open_socket
+from observe import observe
+
+STATUS_FILE = "netpunch_status.txt"
+CODE_TTL = 600          # seconds; codes older than this warn "stale"
+
+# Locked codes. A plain code IS the host's address, so a chat channel full of
+# old codes is a list of IPs. With a password the whole body (candidates +
+# session secret) is encrypted under a slow key derivation and authenticated:
+#   code = 0xFF | ts(4) | ciphertext | tag(16)
+#   key  = PBKDF2-HMAC-SHA256(password, "tpf2mp-code|" + ts, LOCK_ITERS)
+# Without the password an old code reveals only that it is a code and when it
+# was made. The slow KDF (~0.2 s) makes offline guessing of a decent password
+# impractical; a 4-digit PIN is still crackable in under an hour -- say so.
+LOCK_MAGIC = 0xFF
+LOCK_ITERS = 600_000
+LOCK_TAG = 16
+
+
+class LockedCode(ValueError):
+    """The code is locked and no/incorrect password was given."""
+
+
+def _lock_key(password, ts):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               b"tpf2mp-code|" + struct.pack("!I", ts), LOCK_ITERS)
+
+
+def _lock_stream(key, n):
+    out = bytearray(); i = 0
+    while len(out) < n:
+        out += hashlib.sha256(key + b"|ks|" + struct.pack("!I", i)).digest(); i += 1
+    return bytes(out[:n])
+
+
+def _lock(body, ts, password):
+    key = _lock_key(password, ts)
+    ct = bytes(a ^ b for a, b in zip(body, _lock_stream(key, len(body))))
+    tag = hmac.new(key, struct.pack("!I", ts) + ct, hashlib.sha256).digest()[:LOCK_TAG]
+    return bytes([LOCK_MAGIC]) + struct.pack("!I", ts) + ct + tag
+
+
+def _unlock(blob, password):
+    if len(blob) < 1 + 4 + LOCK_TAG:
+        raise ValueError("locked code too short")
+    ts = struct.unpack("!I", blob[1:5])[0]
+    ct, tag = blob[5:-LOCK_TAG], blob[-LOCK_TAG:]
+    if not password:
+        raise LockedCode("this code is locked -- enter the lobby password")
+    key = _lock_key(password, ts)
+    want = hmac.new(key, struct.pack("!I", ts) + ct, hashlib.sha256).digest()[:LOCK_TAG]
+    if not hmac.compare_digest(want, tag):
+        raise LockedCode("wrong password for this code")
+    body = bytes(a ^ b for a, b in zip(ct, _lock_stream(key, len(ct))))
+    return body, ts
+DEFAULT_TIMEOUT = 40    # seconds to keep punching before giving up
+
+# byte-0 bit flags
+_F_OPEN = 0x01
+_F_SYM = 0x02
+_F_CGNAT = 0x04
+_P_LAN = 0x08
+_P_PUB = 0x10
+_P_V6 = 0x20
+_V6_6TO4 = 0x40
+_P_SEC = 0x80          # a 12-byte session secret follows (seal.py session key)
+SECRET_LEN = 12
+
+
+# --------------------------------------------------------------------------- #
+# small utilities
+# --------------------------------------------------------------------------- #
+LOG_SINK = [None]      # the lobby points this at its _log (IP redaction, merged log)
+
+
+def log(msg):
+    """Diagnostics -> stderr (stdout is reserved for the CODE= line).
+
+    The lobby runs race() and _observe_and_announce() from here; their lines
+    ('[race] WON on v4 via <public ip:port>', '[observe] candidates=...') went
+    out unredacted and never reached the host's merged log until the lobby
+    set LOG_SINK."""
+    if LOG_SINK[0] is not None:
+        LOG_SINK[0](msg)
+        return
+    print(msg, file=sys.stderr, flush=True)
+
+
+def write_status(obj, reset=False):
+    """Append (or reset) a JSON-line to the status file."""
+    mode = "w" if reset else "a"
+    with open(STATUS_FILE, mode, encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+def parse_hostport(s):
+    """'1.2.3.4:29471' or '[2002::1]:29471' -> (ip, port). None-safe."""
+    if not s:
+        return None
+    if s.startswith("["):
+        ip, _, rest = s[1:].partition("]")
+        return ip, int(rest.lstrip(":"))
+    ip, _, port = s.rpartition(":")
+    return ip, int(port)
+
+
+# --------------------------------------------------------------------------- #
+# code encode / decode
+# --------------------------------------------------------------------------- #
+def encode_profile(profile, secret=None, password=None):
+    """Serialize a profile dict (from observe) to a short base32 code.
+    ``secret`` (12 bytes) makes the code also carry the session key material:
+    everyone who has the code can seal frames; nobody else can read or inject."""
+    cand = profile["candidates"]
+    flags = profile["flags"]
+    lan = parse_hostport(cand.get("lan_v4"))
+    pub = parse_hostport(cand.get("public_v4"))
+    v6 = parse_hostport(cand.get("v6"))
+
+    b0 = 0
+    if flags.get("open"):
+        b0 |= _F_OPEN
+    if flags.get("symmetric"):
+        b0 |= _F_SYM
+    if flags.get("cgnat"):
+        b0 |= _F_CGNAT
+
+    body = b""
+    if lan:
+        b0 |= _P_LAN
+        body += socket.inet_aton(lan[0]) + struct.pack("!H", lan[1])
+    if pub:
+        b0 |= _P_PUB
+        body += socket.inet_aton(pub[0]) + struct.pack("!H", pub[1])
+    if v6:
+        b0 |= _P_V6
+        v6bytes = socket.inet_pton(socket.AF_INET6, v6[0])
+        derived = (pub is not None and v6bytes[0:2] == b"\x20\x02"
+                   and v6bytes[2:6] == socket.inet_aton(pub[0]))
+        chunk = struct.pack("!H", v6[1])
+        if derived:
+            b0 |= _V6_6TO4
+            chunk += v6bytes[6:16]        # low 80 bits only
+        else:
+            chunk += v6bytes              # full 128 bits
+        body += chunk
+
+    if secret:
+        if len(secret) != SECRET_LEN:
+            raise ValueError("secret must be 12 bytes")
+        b0 |= _P_SEC
+        body += bytes(secret)
+    for key in ("vpn_v4", "vpn2_v4"):   # trailing fields, see the module docstring
+        vpn = parse_hostport(cand.get(key))
+        if vpn:
+            body += socket.inet_aton(vpn[0]) + struct.pack("!H", vpn[1])
+    steam = str(cand.get("steam") or "").strip()
+    if steam.isdigit() and 0 < int(steam) < (1 << 64):
+        body += struct.pack("!Q", int(steam))      # last: see the module docstring
+    ts = int(time.time())
+    if password:
+        blob = _lock(bytes([b0]) + body, ts, password)
+    else:
+        blob = bytes([b0]) + struct.pack("!I", ts) + body
+    return base64.b32encode(blob).decode("ascii").rstrip("=")
+
+
+# A JOIN CODE THAT IS A STEAM ID (2026-09-22). A host whose game runs on Steam shows its
+# SteamID64 as the code -- 17 digits, the number on its Steam profile -- and joiners reach
+# it through Steam's networking alone (the bridge's tunnel, steamtunnel.py). The session
+# secret is not in such a code (a Steam ID is public): the joiner gets it from the host
+# over the tunnel by a key exchange (steamkey.py). The classic code stays for everyone
+# else -- a game without Steam, a dedicated server -- and for a host that ticks CROSS-PLAY.
+STEAM_CODE_LEN = 17
+STEAM_ID_BASE = 76561197960265728    # SteamID64 of individual account 0
+
+
+def steam_code_id(code):
+    """The SteamID64 a join code names when the code IS a Steam ID, else None. Spaces
+    and a pasted profile URL's prefix are tolerated."""
+    s = (code or "").strip().rstrip("/")
+    for prefix in ("https://steamcommunity.com/profiles/", "http://steamcommunity.com/profiles/",
+                   "steamcommunity.com/profiles/"):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):]
+    s = s.replace(" ", "")
+    if len(s) != STEAM_CODE_LEN or not s.isdigit():
+        return None
+    v = int(s)
+    return s if STEAM_ID_BASE < v < STEAM_ID_BASE + (1 << 32) else None
+
+
+def decode_code(code, password=None):
+    """base32 code -> profile-like dict with candidates, flags, ts, age, stale.
+
+    Raises ValueError on a malformed code. A code that is a Steam ID decodes to a
+    profile with ``steam_only`` set, only the ``steam`` candidate and no secret.
+    """
+    sid = steam_code_id(code)
+    if sid:
+        return {
+            "secret": None,
+            "locked": False,
+            "steam_only": True,
+            "candidates": {"lan_v4": None, "public_v4": None, "v6": None, "vpn_v4": None, "vpn2_v4": None, "steam": sid},
+            "flags": {"open": False, "symmetric": False, "cgnat": False, "v6": False},
+            "ts": int(time.time()),
+            "age": 0,
+            "stale": False,
+        }
+    code = code.strip().upper()
+    pad = "=" * (-len(code) % 8)
+    try:
+        blob = base64.b32decode(code + pad)
+    except Exception as e:                               # noqa: BLE001
+        raise ValueError(f"not valid base32: {e}")
+    if len(blob) < 5:
+        raise ValueError("code too short")
+
+    locked = blob[0] == LOCK_MAGIC
+    if locked:
+        body, ts = _unlock(blob, password)      # raises LockedCode
+        blob = bytes([body[0]]) + struct.pack("!I", ts) + body[1:]
+    b0 = blob[0]
+    ts = struct.unpack("!I", blob[1:5])[0]
+    off = 5
+
+    def take(n):
+        nonlocal off
+        chunk = blob[off:off + n]
+        if len(chunk) < n:
+            raise ValueError("truncated code")
+        off += n
+        return chunk
+
+    lan = pub = v6 = None
+    if b0 & _P_LAN:
+        ip = socket.inet_ntoa(take(4))
+        lan = f"{ip}:{struct.unpack('!H', take(2))[0]}"
+    if b0 & _P_PUB:
+        ip = socket.inet_ntoa(take(4))
+        pub = f"{ip}:{struct.unpack('!H', take(2))[0]}"
+    if b0 & _P_V6:
+        port = struct.unpack("!H", take(2))[0]
+        if b0 & _V6_6TO4:
+            if not pub:
+                raise ValueError("6to4-derived v6 but no public_v4 to rebuild")
+            hi = b"\x20\x02" + socket.inet_aton(pub.rsplit(":", 1)[0])
+            v6bytes = hi + take(10)
+        else:
+            v6bytes = take(16)
+        v6 = f"[{socket.inet_ntop(socket.AF_INET6, v6bytes)}]:{port}"
+
+    secret = take(SECRET_LEN) if b0 & _P_SEC else None
+    # the tail: [vpn_v4 6][vpn2_v4 6][steam 8], see the module docstring
+    end = len(blob)
+    steam = None
+    if end - off in (8, 14, 20):
+        sid = struct.unpack("!Q", blob[end - 8:end])[0]
+        steam = str(sid) if sid else None
+        end -= 8
+    vpns = []
+    if end - off in (6, 12):      # the trailing VPN candidates
+        while end - off >= 6:
+            ip = socket.inet_ntoa(take(4))
+            vpns.append(f"{ip}:{struct.unpack('!H', take(2))[0]}")
+    vpn, vpn2 = (vpns + [None, None])[:2]
+    age = int(time.time()) - ts
+    return {
+        "secret": secret,
+        "locked": locked,
+        "candidates": {"lan_v4": lan, "public_v4": pub, "v6": v6, "vpn_v4": vpn, "vpn2_v4": vpn2, "steam": steam},
+        "flags": {
+            "open": bool(b0 & _F_OPEN),
+            "symmetric": bool(b0 & _F_SYM),
+            "cgnat": bool(b0 & _F_CGNAT),
+            "v6": v6 is not None,
+        },
+        "ts": ts,
+        "age": age,
+        "stale": age > CODE_TTL,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# role selection & diagnosis
+# --------------------------------------------------------------------------- #
+def _constrained(flags):
+    return bool(flags.get("symmetric") or flags.get("cgnat"))
+
+
+def choose_role(mine, peer):
+    """Return 'listen', 'dial', or 'punch' (complementary across the two ends).
+
+    Open side listens / constrained side dials only when exactly one end is
+    constrained; otherwise both punch simultaneously (never deadlocks).
+    """
+    if not peer:
+        return "listen"                      # host with no peer code: just wait
+    my_c, peer_c = _constrained(mine), _constrained(peer["flags"])
+    if my_c and not peer_c and peer["flags"].get("open"):
+        return "dial"
+    if not my_c and mine.get("open") and peer_c:
+        return "listen"
+    return "punch"
+
+
+def diagnose(mine, peer, connected):
+    """Return a human/machine reason string when a connect fails, else None."""
+    if connected:
+        return None
+    if peer and peer.get("stale"):
+        return "code stale -- re-exchange a fresh code"
+    if mine and mine["stun"].get("timed_out") and not mine["candidates"].get("public_v4"):
+        return "no UDP out -- STUN got no response; a firewall is likely blocking UDP"
+    mf = mine["flags"] if mine else {}
+    pf = peer["flags"] if peer else {}
+    if mf.get("cgnat") and pf.get("cgnat"):
+        return "both behind CGNAT -- use Tailscale tonight"
+    if mf.get("symmetric") and pf.get("symmetric"):
+        return "both symmetric NATs -- direct punch won't work; use Tailscale"
+    if _constrained(mf) and _constrained(pf):
+        return "both ends NAT-constrained -- use Tailscale"
+    return "handshake timed out on all candidate pairs"
+
+
+# --------------------------------------------------------------------------- #
+# the race
+# --------------------------------------------------------------------------- #
+def _targets_v4(peer, mine=None):
+    # LAN FIRST. When both ends sit behind the same NAT -- two instances on one
+    # machine, or two players in one house -- the LAN address is a direct path,
+    # while the public one hairpins out to the router and back. The hairpin is
+    # slower at best and, on plenty of consumer routers, silently drops the
+    # larger datagrams a save transfer is made of.
+    #
+    # Ordering is all this needs to be: both candidates are still dialled, so a
+    # genuinely remote peer (whose LAN address is unreachable private space)
+    # loses nothing -- its public candidate simply answers and wins.
+    #
+    # SAME NAT -> LAN ONLY. If our public address and the peer's are the same
+    # IP we are behind one router, and the public candidate is a hairpin: out
+    # to the router and back in. Dialling it is not just wasteful, it is what
+    # breaks the save transfer -- the host hears us from BOTH the LAN source and
+    # the hairpinned source, its peer address tracks whichever packet came last,
+    # and a bulk stream aimed at a flapping address never completes (measured:
+    # joiner CONNECTED to 192.168.0.140, host logged the same joiner at its
+    # public address, transfer pinned at 0%). Not creating the second path is
+    # the only fix that does not touch the most-recent-source rule the NAT
+    # re-mapping recovery depends on. Same rule ICE uses.
+    my_pub = None
+    if mine:
+        hp = parse_hostport(mine.get("candidates", {}).get("public_v4"))
+        if hp:
+            my_pub = hp[0]
+    peer_pub = parse_hostport(peer["candidates"].get("public_v4"))
+    same_nat = bool(my_pub and peer_pub and my_pub == peer_pub[0]
+                    and peer["candidates"].get("lan_v4"))
+    # A VPN adapter address (Hamachi, Tailscale) goes first: when both ends
+    # are on the same virtual network it is a direct path with no NAT at all,
+    # the one that works where the punch cannot (CGNAT host, symmetric joiner).
+    keys = ("vpn_v4", "vpn2_v4", "lan_v4") if same_nat else ("vpn_v4", "vpn2_v4", "lan_v4", "public_v4")
+    if same_nat:
+        log("[race] peer shares our public address -> same NAT, dialling LAN only")
+    out = []
+    for key in keys:
+        hp = parse_hostport(peer["candidates"].get(key))
+        if hp:
+            out.append(hp)
+    return out
+
+
+def race(sock_v4, peer, role, local_port, timeout, my_has_v6, mine=None, late_targets=None):
+    """Fire per-family Connections at the peer's candidates; first wins.
+
+    Returns the winning Connection (still live) or None. Losing families are
+    closed. ``sock_v4`` is the shared game/STUN socket so the NAT mapping holds.
+    ``late_targets`` is a list the rendezvous knock appends the master's relay
+    port to once the direct dial has gone unanswered (lobby.py).
+    """
+    conns = []          # list of (family_label, Connection)
+    listen = role == "listen"
+
+    # --- IPv4 family (always attempted; reuses the game socket) ---
+    v4_targets = [] if listen else _targets_v4(peer, mine)
+    v4 = Connection(sock_v4, v4_targets, name="v4", listen=listen,
+                    log=log, extra=late_targets)
+    conns.append(("v4", v4))
+
+    # --- IPv6 family (only if both ends have v6) ---
+    sock_v6 = None
+    if my_has_v6 and peer["flags"].get("v6") and peer["candidates"].get("v6"):
+        try:
+            sock_v6 = open_socket(local_port, socket.AF_INET6)
+            v6_targets = [] if listen else [parse_hostport(peer["candidates"]["v6"])]
+            v6 = Connection(sock_v6, v6_targets, name="v6", listen=listen,
+                            log=log)
+            conns.append(("v6", v6))
+        except OSError as e:
+            log(f"[race] v6 socket unavailable: {e}")
+
+    log(f"[race] role={role}  families={[c[0] for c in conns]}  "
+        f"targets_v4={v4_targets}")
+
+    # --- wait for the first family to connect ---
+    deadline = time.time() + timeout
+    winner = None
+    while time.time() < deadline and winner is None:
+        for label, c in conns:
+            if c.connected.is_set():
+                winner = (label, c)
+                break
+        time.sleep(0.05)
+
+    # --- log outcomes, close losers ---
+    for label, c in conns:
+        if winner and c is winner[1]:
+            log(f"[race] WON on {label} via {c.peer_str}")
+        else:
+            log(f"[race] {label} did not win ({'connected' if c.connected.is_set() else 'no handshake'}); closing")
+            c.close()
+
+    return winner[1] if winner else None
+
+
+# --------------------------------------------------------------------------- #
+# host / join commands
+# --------------------------------------------------------------------------- #
+def _observe_and_announce(local_port, secret=None, password=None, extra_candidates=None):
+    """Observe on a fresh game socket, print our CODE= line, return (sock, profile, code).
+    ``secret`` (12 bytes) is embedded in the code so every member derives the
+    session key (seal.py). ``extra_candidates`` (the host's Steam identity)
+    join the observed ones before the code is made."""
+    sock_v4 = open_socket(local_port, socket.AF_INET)
+    profile = observe(local_port=local_port, sock=sock_v4, do_upnp=True,
+                      keep_upnp=True)
+    mapping = profile.get("upnp", {})
+    if mapping.get("tcp_open"):
+        log(f"[bulk] router accepted TCP mapping on tcp/{local_port}; external reachability still needs a connection")
+    else:
+        detail = mapping.get("tcp_detail") or mapping.get("detail") or "no TCP mapping confirmed"
+        log(f"[bulk] no confirmed TCP router mapping on tcp/{local_port}: {detail}; "
+            "trying IPv6, LAN/VPN and the peer's listener as well")
+    for k, v in (extra_candidates or {}).items():
+        if v:
+            profile["candidates"][k] = v
+    code = encode_profile(profile, secret=secret, password=password)
+    log(f"[observe] flags={profile['flags']} "
+        f"candidates={profile['candidates']} "
+        f"stun_elapsed_ms={profile['stun']['elapsed_ms']} "
+        f"stun_timed_out={profile['stun']['timed_out']}")
+    # The one and only stdout line:
+    print(f"CODE={code}", flush=True)
+    return sock_v4, profile, code
+
+
+def cmd_host(args):
+    write_status({"state": "waiting"}, reset=True)
+    sock_v4, profile, _ = _observe_and_announce(args.local_port)
+
+    # Host defaults to listening (it shared first and is usually the open end).
+    # If the joiner's reply code is fed on stdin, we can flip to dial/punch for
+    # the awkward "host is the constrained one" case.
+    peer_holder = {"peer": None}
+
+    def stdin_reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line.upper().startswith("CODE="):
+                line = line[5:]
+            if not line:
+                continue
+            try:
+                peer_holder["peer"] = decode_code(line)
+                log(f"[host] got peer code: flags={peer_holder['peer']['flags']}")
+            except ValueError as e:
+                log(f"[host] ignoring bad peer code: {e}")
+            break
+
+    threading.Thread(target=stdin_reader, daemon=True).start()
+    # Give a brief moment for a piped reply code to arrive before deciding role.
+    time.sleep(0.3)
+    peer = peer_holder["peer"]
+    role = choose_role(profile["flags"], peer) if peer else "listen"
+
+    conn = race(sock_v4, peer or {"candidates": {}, "flags": {}}, role,
+                args.local_port, args.timeout, profile["flags"]["v6"])
+    return _finish(conn, profile, peer)
+
+
+def cmd_join(args):
+    write_status({"state": "waiting"}, reset=True)
+    try:
+        peer = decode_code(args.code)
+    except ValueError as e:
+        log(f"[join] bad code: {e}")
+        write_status({"state": "failed", "reason": f"bad code: {e}"})
+        return 2
+    if peer["stale"]:
+        log(f"[join] WARNING: code is {peer['age']}s old (>{CODE_TTL}s) -- may be stale")
+    log(f"[join] peer flags={peer['flags']} candidates={peer['candidates']}")
+
+    sock_v4, profile, _ = _observe_and_announce(args.local_port)
+    role = choose_role(profile["flags"], peer)
+
+    conn = race(sock_v4, peer, role, args.local_port, args.timeout,
+                profile["flags"]["v6"])
+    return _finish(conn, profile, peer)
+
+
+def _finish(conn, profile, peer):
+    if conn:
+        write_status({"state": "connected", "peer": conn.peer_str})
+        log(f"[connect] CONNECTED peer={conn.peer_str}")
+        # Hand off: keep the process alive so the socket/mapping stays open for
+        # the game layer. The mod embeds this; standalone we just idle.
+        try:
+            while conn.last_seen_age() < 60:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        conn.close()
+        return 0
+    reason = diagnose(profile, peer, connected=False)
+    write_status({"state": "failed", "reason": reason})
+    log(f"[connect] FAILED: {reason}")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
+# self-test: codec round-trip + a localhost dial/listen race
+# --------------------------------------------------------------------------- #
+def selftest():
+    ok = True
+
+    # --- codec round-trips ---
+    samples = [
+        {"candidates": {"lan_v4": "192.168.1.20:29471",
+                        "public_v4": "198.51.100.77:29471",
+                        "v6": "[2002:c633:644d:1::1000]:29471",
+                        "vpn_v4": "25.37.84.221:29471", "vpn2_v4": "100.92.122.123:29471", "steam": None},
+         "flags": {"open": True, "symmetric": False, "cgnat": False, "v6": True}},
+        {"candidates": {"lan_v4": "10.0.0.5:5000", "public_v4": None,
+                        "v6": "[2001:db8:9b::1925:45e6]:5000", "vpn_v4": None, "vpn2_v4": None, "steam": "76561198000000001"},
+         "flags": {"open": False, "symmetric": True, "cgnat": True, "v6": True}},
+        {"candidates": {"lan_v4": None, "public_v4": "203.0.113.9:1234",
+                        "v6": None, "vpn_v4": "100.92.122.123:1234", "vpn2_v4": None, "steam": "76561197960287930"},
+         "flags": {"open": True, "symmetric": False, "cgnat": False, "v6": False}},
+    ]
+    for i, s in enumerate(samples):
+        code = encode_profile(s)
+        d = decode_code(code)
+        match = (d["candidates"] == s["candidates"]
+                 and d["flags"] == s["flags"])
+        print(f"[selftest] codec #{i}: len={len(code)} "
+              f"{'OK' if match else 'MISMATCH'}  code={code}")
+        if not match:
+            ok = False
+            print(f"           in ={s['candidates']} {s['flags']}")
+            print(f"           out={d['candidates']} {d['flags']}")
+
+    # --- the VPN tail: with a secret, without one, and its place in the dial list ---
+    sec = bytes(range(12))
+    d = decode_code(encode_profile(samples[0], secret=sec))
+    tail_ok = d["secret"] == sec and d["candidates"]["vpn_v4"] == "25.37.84.221:29471"
+    d = decode_code(encode_profile(samples[1], secret=sec))
+    tail_ok = tail_ok and d["secret"] == sec and d["candidates"]["vpn_v4"] is None
+    # a code written without the tail (an older client) decodes as before
+    legacy = {"candidates": dict(samples[0]["candidates"], vpn_v4=None, vpn2_v4=None), "flags": samples[0]["flags"]}
+    tail_ok = tail_ok and decode_code(encode_profile(legacy))["candidates"]["vpn_v4"] is None
+    order = _targets_v4(decode_code(encode_profile(samples[0])), None)
+    tail_ok = tail_ok and order == [("25.37.84.221", 29471), ("100.92.122.123", 29471), ("192.168.1.20", 29471), ("198.51.100.77", 29471)]
+    same = {"candidates": {"public_v4": "198.51.100.77:1", "lan_v4": None, "v6": None}, "flags": {}}
+    order = _targets_v4(decode_code(encode_profile(samples[0])), same)
+    tail_ok = tail_ok and order == [("25.37.84.221", 29471), ("100.92.122.123", 29471), ("192.168.1.20", 29471)]
+    print(f"[selftest] vpn tail + dial order: {'OK' if tail_ok else 'FAIL'}")
+    # --- the Steam tail: last, with 0, 1 or 2 VPN fields before it, with and without a secret ---
+    steam_ok = True
+    both = {"candidates": dict(samples[0]["candidates"], steam="76561198012345678"), "flags": samples[0]["flags"]}
+    for pw in (None, "pw"):
+        d = decode_code(encode_profile(both, secret=sec, password=pw), password=pw)
+        steam_ok = steam_ok and d["secret"] == sec and d["candidates"]["steam"] == "76561198012345678" \
+            and d["candidates"]["vpn_v4"] == "25.37.84.221:29471" and d["candidates"]["vpn2_v4"] == "100.92.122.123:29471"
+    d = decode_code(encode_profile(samples[1], secret=sec))          # steam, no VPN
+    steam_ok = steam_ok and d["candidates"]["steam"] == "76561198000000001" and d["candidates"]["vpn_v4"] is None
+    d = decode_code(encode_profile(samples[2]))                       # one VPN + steam, no secret
+    steam_ok = steam_ok and d["candidates"]["steam"] == "76561197960287930" and d["candidates"]["vpn_v4"] == "100.92.122.123:1234"
+    steam_ok = steam_ok and decode_code(encode_profile(legacy))["candidates"]["steam"] is None
+    steam_ok = steam_ok and _targets_v4(decode_code(encode_profile(both)), None) == \
+        _targets_v4(decode_code(encode_profile(samples[0])), None)   # the tail never enters the v4 dial list
+    print(f"[selftest] steam tail: {'OK' if steam_ok else 'FAIL'}")
+    ok = ok and tail_ok and steam_ok
+    ok = ok and tail_ok
+
+    # --- stale detection ---
+    old = encode_profile(samples[0])
+    blob = bytearray(base64.b32decode(old + "=" * (-len(old) % 8)))
+    struct.pack_into("!I", blob, 1, int(time.time()) - 3600)  # 1h old
+    stale_code = base64.b32encode(bytes(blob)).decode().rstrip("=")
+    print(f"[selftest] stale flag: {'OK' if decode_code(stale_code)['stale'] else 'FAIL'}")
+    ok = ok and decode_code(stale_code)["stale"]
+
+    # --- localhost race: a listener and a dialer must meet ---
+    pa, pb = 29491, 29492
+    sock_listen = open_socket(pa, socket.AF_INET)
+    sock_dial = open_socket(pb, socket.AF_INET)
+    peer_for_listener = {"candidates": {}, "flags": {}}
+    peer_for_dialer = {"candidates": {"public_v4": f"127.0.0.1:{pa}",
+                                      "lan_v4": None, "v6": None},
+                       "flags": {"open": True, "v6": False}}
+    res = {}
+    tl = threading.Thread(target=lambda: res.__setitem__(
+        "L", race(sock_listen, peer_for_listener, "listen", pa, 8, False)))
+    td = threading.Thread(target=lambda: res.__setitem__(
+        "D", race(sock_dial, peer_for_dialer, "dial", pb, 8, False)))
+    tl.start(); td.start(); tl.join(); td.join()
+    race_ok = bool(res.get("L") and res.get("D")
+                   and res["L"].connected.is_set() and res["D"].connected.is_set())
+    print(f"[selftest] listen/dial race: {'OK' if race_ok else 'FAIL'} "
+          f"(L peer={res.get('L') and res['L'].peer_str}, "
+          f"D peer={res.get('D') and res['D'].peer_str})")
+    for c in res.values():
+        if c:
+            c.close()
+    ok = ok and race_ok
+
+    print(f"[selftest] {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="netpunch connect / code exchange")
+    ap.add_argument("mode", choices=["host", "join", "selftest"])
+    ap.add_argument("code", nargs="?", help="peer CODE (join mode)")
+    ap.add_argument("--local-port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    args = ap.parse_args(argv)
+
+    if args.mode == "selftest":
+        return 0 if selftest() else 1
+    if args.mode == "host":
+        return cmd_host(args)
+    if args.mode == "join":
+        if not args.code:
+            ap.error("join requires a CODE argument")
+        return cmd_join(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

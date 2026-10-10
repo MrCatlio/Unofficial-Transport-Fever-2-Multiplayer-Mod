@@ -1,0 +1,39 @@
+name: Netpunch Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: netpunch/requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r netpunch/requirements.txt pyinstaller lupa
+      - name: Protocol and security tests
+        run: |
+          python netpunch/seal.py
+          python netpunch/steamkey.py
+          python netpunch/punch.py --selftest
+          python tools/punch_peer_lock_test.py
+          python tools/version_gate_test.py
+          python tools/rendezvous_test.py
+          python tools/masterserver_auth_test.py
+          python netpunch/modshare.py
+          python tools/gameplay_regression.py --full
+      - name: Build frozen Linux lobby
+        run: |
+          bash tools/linux/build_netpunch.sh --python python --build-dir "$RUNNER_TEMP/netpunch-build" --dist-dir "$RUNNER_TEMP/netpunch-dist" --test
+          test -x "$RUNNER_TEMP/netpunch-dist/netpunch/netpunch"
+          "$RUNNER_TEMP/netpunch-dist/netpunch/netpunch" --help

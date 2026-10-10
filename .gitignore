@@ -1,0 +1,51 @@
+# build output -- rebuild with native/build.bat, installer/build_msi.ps1
+build/
+dist/
+native/out/
+native/linux/out*/
+installer/out/
+dist/linux/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# frozen lobby exe -- rebuild with PyInstaller, see netpunch/README.md
+netpunch/dist/
+netpunch/build/
+netpunch/dist-linux/
+netpunch/build-linux/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# runtime state written by the lobby, the rig scripts and the game hooks
+netpunch/lobby_in.jsonl
+netpunch/lobby_out.jsonl
+netpunch/lobby_state.json
+netpunch/lobby_proc.log
+netpunch/*_out.txt
+netpunch/*_err.txt
+netpunch/netpunch_status.txt
+netpunch/incoming_save.*
+mp_company_perms.txt
+tools/shots/
+*.log
+*.lastsession
+
+# game saves are never committed
+*.sav
+*.sav.lua
+
+# local scratch
+installer/.wix/
+backup/
+.claude/
+*.orig
+docs/audit.md
+
+# per-machine test artifacts (tools/edge_owner_decode_test.py compiles here)
+.local-test/
